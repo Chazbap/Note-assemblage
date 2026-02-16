@@ -5,6 +5,8 @@ from datetime import datetime
 import tempfile
 import hashlib
 import json
+import random
+from urllib.parse import urlencode
 
 from openpyxl import load_workbook
 from openpyxl.styles import Font, Alignment, PatternFill, Border, Side
@@ -29,6 +31,8 @@ st.markdown(
       .small {opacity:.75; font-size:.9rem;}
       .card {padding: .8rem 1rem; border-radius: 14px; background:#f8f9fa; border: 1px solid #e9ecef;}
       code {font-size: .9rem;}
+      .ok {color:#1a7f37; font-weight:600;}
+      .warn {color:#b54708; font-weight:600;}
     </style>
     """,
     unsafe_allow_html=True
@@ -43,7 +47,6 @@ st.markdown(
     <span class="pill">Stocks décrémentés par Code Produit</span>
     <span class="pill">Anti double-application</span>
     <span class="pill">Dégustation live (Supabase)</span>
-    <span class="pill">PIN par essai</span>
     """,
     unsafe_allow_html=True
 )
@@ -51,10 +54,13 @@ st.markdown(
 CEPAGE_LABEL = {"C": "Chardonnay", "N": "Pinot Noir", "M": "Meunier"}
 
 # ==========================================================
-# SUPABASE + PIN
+# SUPABASE (Degustation) - helpers + PIN + lien partage
 # ==========================================================
 @st.cache_resource
 def sb():
+    # Requiert dans Streamlit Secrets :
+    # SUPABASE_URL="..."
+    # SUPABASE_SERVICE_ROLE_KEY="..."
     url = st.secrets.get("SUPABASE_URL", "")
     key = st.secrets.get("SUPABASE_SERVICE_ROLE_KEY", "")
     if not url or not key:
@@ -64,40 +70,41 @@ def sb():
 def supabase_ready():
     return sb() is not None
 
-def _pin_pepper() -> str:
-    return str(st.secrets.get("PIN_PEPPER", "") or "")
+def random_pin_4() -> str:
+    return f"{random.randint(0, 9999):04d}"
 
-def hash_pin(pin: str) -> str:
+def build_share_link(essai_id: str, pin: str) -> str:
     """
-    Hash SHA-256 du PIN + pepper.
-    Le pepper est un secret côté serveur (Streamlit Secrets).
+    Génère un lien de type: https://...streamlit.app/?essai=<id>&pin=<pin>
+    En prod Streamlit Cloud, ça marche bien.
     """
-    pin = (pin or "").strip()
-    h = hashlib.sha256()
-    h.update((pin + _pin_pepper()).encode("utf-8"))
-    return h.hexdigest()
+    try:
+        base = st.context.url.split("?")[0]  # streamlit >= 1.32
+    except Exception:
+        # fallback : lien relatif
+        base = ""
+    q = urlencode({"essai": essai_id, "pin": pin})
+    return f"{base}?{q}" if base else f"?{q}"
 
-def _clean_pin(pin: str) -> str:
-    p = (pin or "").strip()
-    # tolère espaces, mais on veut chiffres
-    p = "".join([c for c in p if c.isdigit()])
-    return p
-
-def sup_create_essai(nom: str, cuves: list[str], pin: str) -> str:
-    p = _clean_pin(pin)
-    pin_hash = hash_pin(p) if p else None
-    payload = {"nom": nom, "cuves": cuves, "pin_hash": pin_hash}
-    res = sb().table("essais").insert(payload).execute()
+def sup_create_essai(nom: str, cuves: list[str], pin_code: str) -> str:
+    # NB: ton SQL a ajouté essais.pin_hash -> on l'utilise comme "pin_code" (PIN en clair)
+    res = sb().table("essais").insert({"nom": nom, "cuves": cuves, "pin_hash": pin_code}).execute()
     return res.data[0]["id"]
 
 def sup_list_essais(limit: int = 50) -> pd.DataFrame:
-    # inclut pin_hash pour pouvoir savoir si essai protégé
     res = sb().table("essais").select("id,created_at,nom,cuves,pin_hash").order("created_at", desc=True).limit(limit).execute()
     return pd.DataFrame(res.data)
 
 def sup_get_essai(essai_id: str) -> dict:
     res = sb().table("essais").select("id,created_at,nom,cuves,pin_hash").eq("id", essai_id).single().execute()
     return res.data
+
+def sup_check_pin(essai_id: str, pin: str) -> bool:
+    try:
+        e = sup_get_essai(essai_id)
+        return str(e.get("pin_hash", "")).strip() == str(pin).strip()
+    except Exception:
+        return False
 
 def sup_upsert_note(essai_id: str, cuve: str, degustateur: str, notes: dict, commentaire: str):
     row = {
@@ -107,6 +114,7 @@ def sup_upsert_note(essai_id: str, cuve: str, degustateur: str, notes: dict, com
         **notes,
         "commentaire": commentaire or "",
     }
+    # Insert puis fallback update si déjà existant (unique index essai_id, cuve, degustateur)
     try:
         sb().table("notes").insert(row).execute()
     except Exception:
@@ -159,7 +167,7 @@ def radar_fig(df_cuve: pd.DataFrame, by_taster: bool = False):
                 g["mineralite"].mean(),
                 g["volume"].mean(),
                 g["sucrosite"].mean(),
-                g["purete"].mean(),
+                (6 - g["defaut"]).mean(),
             ]
             fig.add_trace(go.Scatterpolar(
                 r=vals + [vals[0]],
@@ -186,15 +194,6 @@ def normalize_str(x):
         return ""
     return str(x).strip()
 
-def safe_int_str(x):
-    """Convertit vers int si possible, sinon renvoie str(x). Évite ValueError sur NaN/vides."""
-    if pd.isna(x) or x is None or str(x).strip() == "":
-        return ""
-    try:
-        return str(int(float(str(x).replace(",", ".").strip()))))
-    except Exception:
-        return str(x).strip()
-
 def normalize_cuve_number(x):
     """Corrige des cuves typées en décimal (0,0351) -> 351."""
     if pd.isna(x):
@@ -212,6 +211,26 @@ def normalize_cuve_number(x):
     if 0 < v < 1:
         v = v * 10000
     return int(round(v))
+
+def cuve_to_int_or_none(x):
+    """
+    Convertit N° Cuve en int si possible, sinon None.
+    Gère NaN, "", "351.0", 351.0, etc.
+    """
+    if pd.isna(x):
+        return None
+    try:
+        if isinstance(x, str):
+            xs = x.strip().replace(" ", "").replace(",", ".")
+            if xs == "":
+                return None
+            x = xs
+        v = pd.to_numeric(x, errors="coerce")
+        if pd.isna(v):
+            return None
+        return int(round(float(v)))
+    except Exception:
+        return None
 
 def to_cepage_code(v):
     if pd.isna(v):
@@ -310,7 +329,7 @@ def build_delta_table(snapshot_df: pd.DataFrame, ledger_df: pd.DataFrame) -> pd.
     return delta
 
 # ==========================================================
-# ONGLET 2 : STOCK UPDATE
+# ONGLET 3 : STOCK UPDATE
 # ==========================================================
 def build_stock_snapshot(df_stock):
     required = {"Produit", "En Stock"}
@@ -420,10 +439,7 @@ def export_stock_with_highlight_and_journal(updated_df, cons_df, journal_df, ref
     recap = cons_df.copy()
     total = float(recap["Consommé (L)"].sum()) if not recap.empty else 0.0
     recap = pd.concat(
-        [
-            recap,
-            pd.DataFrame([{"Code Produit en Cuve": "TOTAL", "Consommé (L)": round(total, 2)}]),
-        ],
+        [recap, pd.DataFrame([{"Code Produit en Cuve": "TOTAL", "Consommé (L)": round(total, 2)}])],
         ignore_index=True
     )
 
@@ -543,8 +559,14 @@ def tab_assemblage():
         df_cuves["Produit"] = norm_str_series(df_cuves["Produit"])
     if "Cépage" in df_cuves.columns:
         df_cuves["Cépage"] = norm_str_series(df_cuves["Cépage"])
+
+    # Robustesse N° Cuve
     if "N° Cuve" in df_cuves.columns:
         df_cuves["N° Cuve"] = df_cuves["N° Cuve"].apply(normalize_cuve_number)
+        df_cuves["_cuve_int"] = df_cuves["N° Cuve"].apply(cuve_to_int_or_none)
+        df_cuves = df_cuves[df_cuves["_cuve_int"].notna()].copy()
+        df_cuves["N° Cuve"] = df_cuves["_cuve_int"].astype(int)
+        df_cuves.drop(columns=["_cuve_int"], inplace=True)
 
     for d in (df_codes, df_codes_ass):
         for col in ["Code Produit en Cuve", "Clé Produit en Cuve", "Libéllé Produit en Cuve"]:
@@ -668,12 +690,12 @@ def tab_assemblage():
         right_on="Code Produit en Cuve"
     )
 
-    # Préparer la liste de cuves pour dégustation
+    # Liste cuves dégustation
     cuves_for_tasting = (
         df_selection[["N° Cuve", "Produit"]]
         .drop_duplicates()
         .sort_values(["N° Cuve", "Produit"])
-        .apply(lambda r: f"{safe_int_str(r['N° Cuve'])} - {str(r['Produit']).strip()}", axis=1)
+        .apply(lambda r: f"{r['N° Cuve']} - {str(r['Produit']).strip()}", axis=1)
         .tolist()
     )
     st.session_state["last_cuves_for_tasting"] = cuves_for_tasting
@@ -810,7 +832,7 @@ def tab_assemblage():
         df_final = pd.concat([df_final, pd.DataFrame([st_row])], ignore_index=True)
 
     # =========================
-    # EXCEL OUTPUT
+    # EXCEL OUTPUT (inchangé)
     # =========================
     with tempfile.NamedTemporaryFile(delete=False, suffix=".xlsx") as tmp:
         fichier_excel = tmp.name
@@ -919,7 +941,6 @@ def tab_assemblage():
                             ws[f"{col_letter}{r}"].number_format = "0.00"
                 current_start = r + 1
 
-        # ✅ RÉCAP % (via colonne tech)
         recap_rows = [
             ("RÉCAP % - 2025 (Vin de l'année)", None),
             ("Chardonnay", "C"),
@@ -1018,15 +1039,17 @@ def tab_assemblage():
                     else:
                         ws[f"{col_letter}{dernier_row}"].number_format = "0.00"
 
-        # Couleurs C/N/M + sous-total
         for r in range(data_start_row, ws.max_row + 1):
             cat = str(ws[f"{tech_col_letter}{r}"].value).strip().upper()
             if cat == "C":
-                for cell in ws[r]: cell.fill = fill_vert
+                for cell in ws[r]:
+                    cell.fill = fill_vert
             elif cat == "N":
-                for cell in ws[r]: cell.fill = fill_rouge
+                for cell in ws[r]:
+                    cell.fill = fill_rouge
             elif cat == "M" or "ASSEMBLAGE" in cat:
-                for cell in ws[r]: cell.fill = fill_gris
+                for cell in ws[r]:
+                    cell.fill = fill_gris
 
             if ws[f"A{r}"].value == "Sous-total":
                 for cell in ws[r]:
@@ -1095,14 +1118,12 @@ def tab_assemblage():
     with open(fichier_excel, "rb") as f:
         st.download_button("📥 Télécharger l'assemblage (Excel)", f, file_name="assemblage.xlsx", use_container_width=True)
 
-    # =========================
-    # Dégustation (création essai + PIN + lien)
-    # =========================
+    # Création essai + PIN + lien partageable
     st.divider()
-    st.subheader("🍷 Dégustation (optionnel)")
+    st.subheader("🍷 Dégustation (optionnel) — partage aux dégustateurs")
 
     if not supabase_ready():
-        st.info("Supabase non configuré (ajoute SUPABASE_URL + SUPABASE_SERVICE_ROLE_KEY + APP_BASE_URL dans st.secrets).")
+        st.info("Supabase non configuré (ajoute SUPABASE_URL + SUPABASE_SERVICE_ROLE_KEY dans st.secrets).")
         return
 
     cuves_for_tasting = st.session_state.get("last_cuves_for_tasting", [])
@@ -1113,32 +1134,31 @@ def tab_assemblage():
     default_essai_name = f"{titre_excel} — {datetime.now().strftime('%Y-%m-%d %H:%M')}"
     essai_name = st.text_input("Nom de l'essai dégustation", value=default_essai_name, key="essai_name_auto")
 
-    st.caption("🔒 Définis un PIN (ex: 4 chiffres) : tu partageras le lien + le PIN aux dégustateurs.")
-    pin = st.text_input("PIN (4 chiffres)", value="", max_chars=8, type="password", key="essai_pin")
+    colp1, colp2 = st.columns([1, 1])
+    with colp1:
+        pin = st.text_input("PIN 4 chiffres (à partager)", value=st.session_state.get("pin_suggest", random_pin_4()), max_chars=4)
+        st.session_state["pin_suggest"] = pin
+    with colp2:
+        st.caption("💡 Le lien contiendra essai+PIN, donc accès direct à la saisie.")
 
     if st.button("✅ Créer l'essai dégustation (Supabase)", type="primary"):
-        p = _clean_pin(pin)
-        if len(p) < 4:
-            st.error("PIN trop court. Mets au moins 4 chiffres.")
-            st.stop()
+        pin_ok = str(pin).strip()
+        if len(pin_ok) != 4 or not pin_ok.isdigit():
+            st.error("Le PIN doit être exactement 4 chiffres (ex: 0427).")
+            return
 
-        essai_id = sup_create_essai(essai_name, cuves_for_tasting, p)
+        essai_id = sup_create_essai(essai_name, cuves_for_tasting, pin_ok)
         st.session_state["deg_essai_id"] = essai_id
+        st.success("Essai créé ✅ — les dégustateurs peuvent utiliser le lien ci-dessous")
         sup_fetch_notes.clear()
 
-        base = (st.secrets.get("APP_BASE_URL", "") or "").rstrip("/")
-        share_url = f"{base}/?essai={essai_id}" if base else ""
-
-        st.success("Essai créé ✅")
-        if share_url:
-            st.write("➡️ **Lien à envoyer aux dégustateurs :**")
-            st.code(share_url)
-        st.write("🔑 **PIN à transmettre (séparément) :**")
-        st.code(p)
-        st.caption("Conseil : envoie le lien sur Teams + le PIN dans un second message.")
+        link = build_share_link(essai_id, pin_ok)
+        st.markdown("### 🔗 Lien à partager")
+        st.code(link)
+        st.caption("Copie/colle ce lien dans Teams / Outlook : il ouvre directement la saisie avec essai+PIN.")
 
 # ==========================================================
-# ONGLET : DEGUSTATION LIVE (SUPABASE) + PIN
+# ONGLET 2 : DEGUSTATION LIVE (SUPABASE) + PIN + lien
 # ==========================================================
 def tab_degustation_live():
     st.subheader("🍷 Dégustation Live (multi-dégustateurs, consolidation auto)")
@@ -1147,83 +1167,299 @@ def tab_degustation_live():
         st.error("Supabase non configuré. Ajoute SUPABASE_URL et SUPABASE_SERVICE_ROLE_KEY dans les Secrets Streamlit.")
         st.stop()
 
-    # --- Auto-select essai via URL ?essai=...
-    try:
-        q = st.query_params  # Streamlit récent
-        essai_from_url = q.get("essai", "")
-    except Exception:
-        q = st.experimental_get_query_params()
-        essai_from_url = (q.get("essai", [""]) or [""])[0]
-
-    if essai_from_url:
-        st.session_state["deg_essai_id"] = essai_from_url
-
     st.markdown(
         """
         <div class="card">
           <div><b>Principe :</b> chaque note est enregistrée en base (Supabase). Le dashboard se met à jour automatiquement.</div>
           <div class="small">Pureté = 6 - Défaut (pour que “plus grand = mieux” sur l’araignée).</div>
-          <div class="small"><b>Sécurité :</b> un PIN est requis par essai (si défini).</div>
         </div>
         """,
         unsafe_allow_html=True
     )
 
-    # Charger un essai
+    # Auto-load depuis l'URL (lien partagé)
+    qp = st.query_params
+    if qp.get("essai"):
+        st.session_state["deg_essai_id"] = qp.get("essai")
+    if qp.get("pin"):
+        st.session_state["deg_pin"] = qp.get("pin")
+
     df_ess = sup_list_essais()
     current = st.session_state.get("deg_essai_id", "")
 
     c1, c2 = st.columns([1.6, 1])
     with c1:
         if df_ess.empty:
-            st.info("Aucun essai. Crée-en un depuis l’onglet Assemblage (bouton dégustation) ou ci-dessous.")
-        else:
-            df_ess["label"] = df_ess.apply(lambda r: f"{r['nom']}  —  {r['created_at']}", axis=1)
-            options = dict(zip(df_ess["label"], df_ess["id"]))
-            default_idx = 0
-            if current and current in df_ess["id"].tolist():
-                default_idx = df_ess["id"].tolist().index(current)
+            st.info("Aucun essai. Crée-en un depuis l’onglet Assemblage.")
+            st.stop()
 
-            chosen_label = st.selectbox("Essai à utiliser", list(options.keys()), index=default_idx)
-            chosen_id = options[chosen_label]
-            st.session_state["deg_essai_id"] = chosen_id
+        df_ess["label"] = df_ess.apply(lambda r: f"{r['nom']}  —  {r['created_at']}", axis=1)
+        options = dict(zip(df_ess["label"], df_ess["id"]))
+
+        default_idx = 0
+        if current and current in df_ess["id"].tolist():
+            default_idx = df_ess["id"].tolist().index(current)
+
+        chosen_label = st.selectbox("Essai à utiliser", list(options.keys()), index=default_idx)
+        chosen_id = options[chosen_label]
+        st.session_state["deg_essai_id"] = chosen_id
 
     with c2:
-        st.caption("Créer un essai manuellement (si besoin)")
-        default_name = f"Essai {datetime.now().strftime('%Y-%m-%d %H:%M')}"
-        nom = st.text_input("Nom", value=default_name, key="manual_essai_name")
-        cuves_txt = st.text_area("Cuves (1 par ligne)", height=100, key="manual_cuves")
-        pin_m = st.text_input("PIN (4 chiffres)", value="", max_chars=8, type="password", key="manual_pin")
-        cuves = [x.strip() for x in cuves_txt.splitlines() if x.strip()]
-        if st.button("➕ Créer essai (manuel)"):
-            p = _clean_pin(pin_m)
-            if not cuves:
-                st.error("Ajoute au moins une cuve.")
-            elif len(p) < 4:
-                st.error("PIN trop court (min 4 chiffres).")
-            else:
-                new_id = sup_create_essai(nom, cuves, p)
-                st.session_state["deg_essai_id"] = new_id
-                st.success("Essai créé ✅")
-                sup_fetch_notes.clear()
+        pin = st.text_input("PIN dégustation", value=st.session_state.get("deg_pin", ""), max_chars=4)
+        st.session_state["deg_pin"] = pin
 
     essai_id = st.session_state.get("deg_essai_id", "")
     if not essai_id:
         st.stop()
 
-    # Charger l'essai (inclut pin_hash)
-    essai = sup_get_essai(essai_id)
-    cuves = essai.get("cuves", []) or []
-    pin_hash = essai.get("pin_hash", None)
+    if not pin or not sup_check_pin(essai_id, pin):
+        st.warning("🔒 PIN incorrect. Demande le lien/ PIN à la personne qui a créé l’essai.")
+        st.stop()
 
+    essai = sup_get_essai(essai_id)
+    cuves = essai.get("cuves", [])
     st.caption(f"Essai : **{essai.get('nom','')}** — {len(cuves)} cuve(s)")
 
-    # --- Gate PIN (par essai) ---
-    # On mémorise l'autorisation dans session_state par essai_id
-    gate_key = f"pin_ok_{essai_id}"
-    if gate_key not in st.session_state:
-        st.session_state[gate_key] = False
+    subtab1, subtab2 = st.tabs(["📝 Saisie dégustateur", "📡 Dashboard live"])
 
-    if pin_hash and not st.session_state[gate_key]:
-        st.warning("🔒 Cet essai est protégé par un PIN.")
-        pin_try = st.text_input
+    with subtab1:
+        colA, colB, colC = st.columns([1, 1, 1])
+        with colA:
+            degustateur = st.text_input("Dégustateur", value=st.session_state.get("degustateur", ""))
+            if degustateur:
+                st.session_state["degustateur"] = degustateur
+
+        # --- cuve courante en session + bouton suivant fiable ---
+        if "__current_cuve__" not in st.session_state:
+            st.session_state["__current_cuve__"] = cuves[0] if cuves else ""
+
+        with colB:
+            if cuves:
+                idx = cuves.index(st.session_state["__current_cuve__"]) if st.session_state["__current_cuve__"] in cuves else 0
+                cuve = st.selectbox("Cuve", cuves, index=idx, key="deg_cuve_select")
+                st.session_state["__current_cuve__"] = cuve
+            else:
+                cuve = st.selectbox("Cuve", ["(aucune)"])
+
+        with colC:
+            st.caption("➡️ Avancer sans se tromper")
+
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            acidite = st.slider("Acidité", 1, 5, 3)
+            amertume = st.slider("Amertume", 1, 5, 3)
+        with c2:
+            mineralite = st.slider("Minéralité", 1, 5, 3)
+            volume = st.slider("Volume", 1, 5, 3)
+        with c3:
+            sucrosite = st.slider("Sucrosité", 1, 5, 3)
+            defaut = st.slider("Défaut (1=aucun, 5=fort)", 1, 5, 1)
+
+        commentaire = st.text_area("Commentaire", height=100)
+
+        colS, colN = st.columns([1, 1])
+        with colS:
+            if st.button("✅ Envoyer / Mettre à jour", type="primary", use_container_width=True):
+                if not degustateur.strip():
+                    st.error("Renseigne le nom du dégustateur.")
+                else:
+                    notes = {
+                        "acidite": acidite,
+                        "amertume": amertume,
+                        "mineralite": mineralite,
+                        "volume": volume,
+                        "sucrosite": sucrosite,
+                        "defaut": defaut,
+                    }
+                    sup_upsert_note(essai_id, cuve, degustateur.strip(), notes, commentaire)
+                    st.success("Note enregistrée ✅")
+                    sup_fetch_notes.clear()
+
+        with colN:
+            if st.button("➡️ Cuve suivante", use_container_width=True):
+                if cuves:
+                    idx = cuves.index(st.session_state["__current_cuve__"])
+                    st.session_state["__current_cuve__"] = cuves[(idx + 1) % len(cuves)]
+                    # recharger en forçant le selectbox à refléter __current_cuve__
+                    st.rerun()
+
+    with subtab2:
+        refresh_s = st.slider("Refresh (secondes)", 1, 5, 2)
+        by_taster = st.checkbox("Afficher aussi par dégustateur", value=False)
+
+        st_autorefresh(interval=refresh_s * 1000, key="deg_live_refresh")
+
+        df = sup_fetch_notes(essai_id)
+        if df.empty:
+            st.info("Aucune note pour le moment.")
+            st.stop()
+
+        st.caption(f"{len(df)} note(s) — {df['cuve'].nunique()} cuve(s) — {df['degustateur'].nunique()} dégustateur(s)")
+
+        cuves_with_data = [c for c in cuves if c in set(df["cuve"].dropna())]
+        cuves_no_data = [c for c in cuves if c not in set(df["cuve"].dropna())]
+        if cuves_no_data:
+            st.caption("Sans notes : " + ", ".join(cuves_no_data))
+
+        for i in range(0, len(cuves_with_data), 3):
+            cols = st.columns(3)
+            for j in range(3):
+                if i + j >= len(cuves_with_data):
+                    break
+                cuv = cuves_with_data[i + j]
+                dcuve = df[df["cuve"] == cuv]
+                with cols[j]:
+                    st.markdown(f"**Cuve : {cuv}**  \nVotes : {len(dcuve)}")
+                    st.plotly_chart(radar_fig(dcuve, by_taster=by_taster), use_container_width=True)
+
+        with st.expander("💬 Commentaires"):
+            st.dataframe(
+                df[["created_at", "cuve", "degustateur", "commentaire"]].sort_values("created_at", ascending=False),
+                use_container_width=True
+            )
+
+# ==========================================================
+# ONGLET 3 : STOCK UPDATE (ANTI DOUBLE + DELTA + EXPORT)
+# ==========================================================
+def tab_stock_update():
+    st.subheader("📦 Mise à jour des stocks (anti double-application + rapprochement)")
+    st.markdown(
+        """
+        <div class="card">
+          <div><b>But :</b> importer l'état de stock + l'assemblage validé (essai choisi) et décrémenter le stock par <b>Code Produit en Cuve</b>.</div>
+          <div class="small">Anti double-application : même fichier + essai + ref + date = bloqué si déjà appliqué (via Fingerprint).</div>
+          <div class="small">Rapprochement : compare l'état réel (snapshot) vs le ledger théorique.</div>
+        </div>
+        """,
+        unsafe_allow_html=True
+    )
+
+    col1, col2, col3 = st.columns([1.2, 1.2, 1])
+    with col1:
+        stock_file = st.file_uploader("📥 État des stocks (Excel)", type=["xlsx"], key="stock_file")
+        st.caption("Colonnes attendues : Produit, En Stock")
+    with col2:
+        assemblage_file = st.file_uploader("🧪 Assemblage validé (Excel)", type=["xlsx"], key="ass_valid")
+        st.caption("On lit 'Code Produit en Cuve' + 'Quantité utilisée E1/E2...'")
+    with col3:
+        ledger_file = st.file_uploader("🗂️ Optionnel : Ledger précédent (export de l'app)", type=["xlsx"], key="ledger_prev")
+        st.caption("Permet de cumuler plusieurs assemblages.")
+
+    st.divider()
+    a, b, c, d = st.columns([1, 1, 1, 1.2])
+    with a:
+        essai = st.selectbox("Essai à appliquer", ["E1", "E2", "E3", "E4", "E5"], index=0)
+    with b:
+        date_conso = st.date_input("Date", value=datetime.now().date())
+    with c:
+        ref_assemblage = st.text_input("Référence", value=f"Assemblage_{datetime.now().strftime('%Y%m%d')}")
+    with d:
+        st.caption("💡 Mets la référence du lot validé (ou n° de fiche).")
+
+    if not stock_file or not assemblage_file:
+        st.info("👉 Importer état des stocks + assemblage validé.")
+        return
+
+    try:
+        df_stock = pd.read_excel(stock_file)
+        snapshot = build_stock_snapshot(df_stock)
+
+        existing_journal = None
+        if ledger_file:
+            ledger = read_ledger(ledger_file)
+            existing_journal = read_existing_journal(ledger_file)
+            st.success("Ledger existant chargé ✅")
+        else:
+            ledger = init_ledger_from_snapshot(snapshot)
+            existing_journal = None
+            st.warning("Aucun ledger fourni → initialisation depuis l'état des stocks.")
+
+        assemblage_bytes = assemblage_file.getvalue()
+        fp = make_fingerprint(assemblage_bytes, essai=essai, ref=ref_assemblage, date_conso=date_conso)
+
+        if journal_has_fingerprint(existing_journal, fp):
+            st.error("⛔ Cet assemblage a déjà été appliqué au stock (même fichier + essai + ref + date).")
+            st.stop()
+
+        cons = read_consumption_from_assemblage(assemblage_file, essai=essai)
+
+        x1, x2, x3 = st.columns(3)
+        x1.metric("Codes consommés", int(len(cons)))
+        x2.metric("Total consommé (L)", float(cons["Consommé (L)"].sum()) if not cons.empty else 0.0)
+        x3.metric("Fingerprint", fp)
+
+        st.markdown("### 🧾 Récap consommation (par code produit)")
+        st.dataframe(cons, use_container_width=True)
+
+        updated = apply_consumption(ledger, cons)
+        issues = updated[updated["Surconsommation (L)"] > 0].copy()
+
+        if not issues.empty:
+            st.error("⛔ Surconsommation détectée : dépassement de stock restant !")
+            st.dataframe(issues[["Code Produit en Cuve", "Stock restant (L)", "Consommé (L)", "Surconsommation (L)"]], use_container_width=True)
+            return
+
+        st.success("✅ OK : stock mise à jour possible.")
+        st.markdown("### 📌 Aperçu stock à jour")
+        st.dataframe(updated.drop(columns=["Surconsommation (L)"]), use_container_width=True)
+
+        journal_new = cons.copy()
+        journal_new["Date"] = pd.to_datetime(date_conso)
+        journal_new["Référence"] = ref_assemblage
+        journal_new["Essai"] = essai
+        journal_new["Fingerprint"] = fp
+        journal_new = journal_new[["Date", "Référence", "Essai", "Fingerprint", "Code Produit en Cuve", "Consommé (L)"]]
+
+        if existing_journal is not None and not existing_journal.empty:
+            journal_all = pd.concat([existing_journal, journal_new], ignore_index=True)
+        else:
+            journal_all = journal_new
+
+        st.markdown("### 🔎 Rapprochement : État des stocks vs Ledger")
+        delta = build_delta_table(snapshot, updated)
+
+        seuil = st.number_input("Seuil d'alerte écart (L)", min_value=0.0, value=50.0, step=10.0)
+        delta_alert = delta[delta["Écart (Etat - Ledger)"].abs() >= float(seuil)]
+
+        d1, d2 = st.columns(2)
+        d1.metric("Nb codes (écart >= seuil)", int(len(delta_alert)))
+        d2.metric("Écart max (L)", float(delta["Écart (Etat - Ledger)"].abs().max()) if not delta.empty else 0.0)
+
+        st.dataframe(delta.head(200), use_container_width=True)
+
+        if not delta_alert.empty:
+            st.warning("⚠️ Des écarts importants existent (transferts, pertes, snapshot différent du théorique).")
+            st.dataframe(delta_alert.head(200), use_container_width=True)
+
+        out_path = export_stock_with_highlight_and_journal(
+            updated_df=updated,
+            cons_df=cons,
+            journal_df=journal_all,
+            ref_assemblage=ref_assemblage,
+            date_conso=date_conso
+        )
+
+        with open(out_path, "rb") as f:
+            st.download_button(
+                "📥 Télécharger STOCK_MAJ (surligné) + RECAP_CONSO + JOURNAL",
+                f,
+                file_name=f"STOCK_MAJ_{ref_assemblage}.xlsx",
+                use_container_width=True
+            )
+
+    except Exception as e:
+        st.error(f"Erreur : {e}")
+
+# ==========================================================
+# ROUTING
+# ==========================================================
+tab1, tab2, tab3 = st.tabs(["🧪 Assemblage", "🍷 Dégustation Live", "📦 Mise à jour stocks"])
+
+with tab1:
+    tab_assemblage()
+
+with tab2:
+    tab_degustation_live()
+
+with tab3:
+    tab_stock_update()
