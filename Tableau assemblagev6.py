@@ -184,6 +184,27 @@ def normalize_cuve_number(x):
         v = v * 10000
     return int(round(v))
 
+# ✅ NEW: robust conversion cuve -> int or None
+def cuve_to_int_or_none(x):
+    """
+    Convertit N° Cuve en int si possible, sinon None.
+    Gère NaN, "", "351.0", 351.0, etc.
+    """
+    if pd.isna(x):
+        return None
+    try:
+        if isinstance(x, str):
+            xs = x.strip().replace(" ", "").replace(",", ".")
+            if xs == "":
+                return None
+            x = xs
+        v = pd.to_numeric(x, errors="coerce")
+        if pd.isna(v):
+            return None
+        return int(round(float(v)))
+    except Exception:
+        return None
+
 def to_cepage_code(v):
     if pd.isna(v):
         return ""
@@ -514,8 +535,14 @@ def tab_assemblage():
         df_cuves["Produit"] = norm_str_series(df_cuves["Produit"])
     if "Cépage" in df_cuves.columns:
         df_cuves["Cépage"] = norm_str_series(df_cuves["Cépage"])
+
+    # ✅ Robustesse N° Cuve (fix crash)
     if "N° Cuve" in df_cuves.columns:
         df_cuves["N° Cuve"] = df_cuves["N° Cuve"].apply(normalize_cuve_number)
+        df_cuves["_cuve_int"] = df_cuves["N° Cuve"].apply(cuve_to_int_or_none)
+        df_cuves = df_cuves[df_cuves["_cuve_int"].notna()].copy()
+        df_cuves["N° Cuve"] = df_cuves["_cuve_int"].astype(int)
+        df_cuves.drop(columns=["_cuve_int"], inplace=True)
 
     for d in (df_codes, df_codes_ass):
         for col in ["Code Produit en Cuve", "Clé Produit en Cuve", "Libéllé Produit en Cuve"]:
@@ -639,13 +666,12 @@ def tab_assemblage():
         right_on="Code Produit en Cuve"
     )
 
-    # NEW: préparer la liste de cuves pour dégustation (zéro ID à taper)
-    # Format conseillé : "N°Cuve - CodeProduit"
+    # ✅ NEW: préparer la liste de cuves pour dégustation (plus de int(...))
     cuves_for_tasting = (
         df_selection[["N° Cuve", "Produit"]]
         .drop_duplicates()
         .sort_values(["N° Cuve", "Produit"])
-        .apply(lambda r: f"{int(r['N° Cuve'])} - {str(r['Produit']).strip()}", axis=1)
+        .apply(lambda r: f"{r['N° Cuve']} - {str(r['Produit']).strip()}", axis=1)
         .tolist()
     )
     st.session_state["last_cuves_for_tasting"] = cuves_for_tasting
@@ -891,7 +917,6 @@ def tab_assemblage():
                             ws[f"{col_letter}{r}"].number_format = "0.00"
                 current_start = r + 1
 
-        # ✅ RÉCAP % (via colonne tech)
         recap_rows = [
             ("RÉCAP % - 2025 (Vin de l'année)", None),
             ("Chardonnay", "C"),
@@ -990,15 +1015,17 @@ def tab_assemblage():
                     else:
                         ws[f"{col_letter}{dernier_row}"].number_format = "0.00"
 
-        # Couleurs C/N/M + sous-total
         for r in range(data_start_row, ws.max_row + 1):
             cat = str(ws[f"{tech_col_letter}{r}"].value).strip().upper()
             if cat == "C":
-                for cell in ws[r]: cell.fill = fill_vert
+                for cell in ws[r]:
+                    cell.fill = fill_vert
             elif cat == "N":
-                for cell in ws[r]: cell.fill = fill_rouge
+                for cell in ws[r]:
+                    cell.fill = fill_rouge
             elif cat == "M" or "ASSEMBLAGE" in cat:
-                for cell in ws[r]: cell.fill = fill_gris
+                for cell in ws[r]:
+                    cell.fill = fill_gris
 
             if ws[f"A{r}"].value == "Sous-total":
                 for cell in ws[r]:
@@ -1082,7 +1109,7 @@ def tab_assemblage():
         if st.button("✅ Créer l'essai dégustation (Supabase)", type="primary"):
             essai_id = sup_create_essai(essai_name, cuves_for_tasting)
             st.session_state["deg_essai_id"] = essai_id
-            st.success(f"Essai créé ✅ (ID interne) — va dans l’onglet 🍷 Dégustation Live")
+            st.success("Essai créé ✅ — va dans l’onglet 🍷 Dégustation Live")
             sup_fetch_notes.clear()
     else:
         st.info("Aucune cuve en session pour créer un essai.")
@@ -1107,7 +1134,6 @@ def tab_degustation_live():
         unsafe_allow_html=True
     )
 
-    # Charger un essai
     df_ess = sup_list_essais()
     current = st.session_state.get("deg_essai_id", "")
 
@@ -1196,7 +1222,6 @@ def tab_degustation_live():
                 st.session_state["__next_cuve__"] = next_cuve
                 st.rerun()
 
-        # petit hack : on repositionne la cuve via session state si besoin
         if "__next_cuve__" in st.session_state:
             st.session_state.pop("__next_cuve__", None)
 
@@ -1236,7 +1261,7 @@ def tab_degustation_live():
             )
 
 # ==========================================================
-# ONGLET 2 : STOCK UPDATE (ANTI DOUBLE + DELTA + EXPORT)
+# ONGLET 3 : STOCK UPDATE (ANTI DOUBLE + DELTA + EXPORT)
 # ==========================================================
 def tab_stock_update():
     st.subheader("📦 Mise à jour des stocks (anti double-application + rapprochement)")
