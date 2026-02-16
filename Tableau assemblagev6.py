@@ -1179,83 +1179,51 @@ def tab_degustation_live():
 
     with subtab1:
         colA, colB = st.columns([1, 1])
-
-        # -------------------------
-        # Dégustateur + Cuve
-        # -------------------------
         with colA:
             degustateur = st.text_input("Dégustateur", value=st.session_state.get("degustateur", ""))
             if degustateur:
                 st.session_state["degustateur"] = degustateur
-
         with colB:
-            cuves_list = cuves if cuves else ["(aucune)"]
+            cuve = st.selectbox("Cuve", cuves) if cuves else st.selectbox("Cuve", ["(aucune)"])
 
-            if "deg_cuve_idx" not in st.session_state:
-                st.session_state["deg_cuve_idx"] = 0
-
-            # borne l'index
-            st.session_state["deg_cuve_idx"] = int(st.session_state["deg_cuve_idx"]) % len(cuves_list)
-
-            cuve = st.selectbox(
-                "Cuve",
-                options=cuves_list,
-                index=st.session_state["deg_cuve_idx"],
-                key="deg_cuve_selectbox"
-            )
-
-            # si l'utilisateur change manuellement la cuve, on synchronise l'index
-            try:
-                st.session_state["deg_cuve_idx"] = cuves_list.index(cuve)
-            except ValueError:
-                st.session_state["deg_cuve_idx"] = 0
-
-        # -------------------------
-        # Notes
-        # -------------------------
         c1, c2, c3 = st.columns(3)
         with c1:
-            acidite = st.slider("Acidité", 1, 5, 3, key="sl_acidite")
-            amertume = st.slider("Amertume", 1, 5, 3, key="sl_amertume")
+            acidite = st.slider("Acidité", 1, 5, 3)
+            amertume = st.slider("Amertume", 1, 5, 3)
         with c2:
-            mineralite = st.slider("Minéralité", 1, 5, 3, key="sl_mineralite")
-            volume = st.slider("Volume", 1, 5, 3, key="sl_volume")
+            mineralite = st.slider("Minéralité", 1, 5, 3)
+            volume = st.slider("Volume", 1, 5, 3)
         with c3:
-            sucrosite = st.slider("Sucrosité", 1, 5, 3, key="sl_sucrosite")
-            defaut = st.slider("Défaut (1=aucun, 5=fort)", 1, 5, 1, key="sl_defaut")
+            sucrosite = st.slider("Sucrosité", 1, 5, 3)
+            defaut = st.slider("Défaut (1=aucun, 5=fort)", 1, 5, 1)
 
-        commentaire = st.text_area("Commentaire", height=100, key="tx_commentaire")
+        commentaire = st.text_area("Commentaire", height=100)
 
-        # -------------------------
-        # ✅ Un seul bouton : sauvegarde + cuve suivante
-        # -------------------------
-        if st.button("✅ Sauvegarder + Cuve suivante", type="primary"):
+        if st.button("✅ Envoyer / Mettre à jour", type="primary"):
             if not degustateur.strip():
                 st.error("Renseigne le nom du dégustateur.")
-                st.stop()
-            if not cuves_list or cuves_list[0] == "(aucune)":
-                st.error("Aucune cuve disponible.")
-                st.stop()
+            else:
+                notes = {
+                    "acidite": acidite,
+                    "amertume": amertume,
+                    "mineralite": mineralite,
+                    "volume": volume,
+                    "sucrosite": sucrosite,
+                    "defaut": defaut,
+                }
+                sup_upsert_note(essai_id, cuve, degustateur.strip(), notes, commentaire)
+                st.success("Note enregistrée ✅")
+                sup_fetch_notes.clear()
 
-            notes = {
-                "acidite": acidite,
-                "amertume": amertume,
-                "mineralite": mineralite,
-                "volume": volume,
-                "sucrosite": sucrosite,
-                "defaut": defaut,
-            }
+        if st.button("➡️ Cuve suivante"):
+            if cuves:
+                idx = cuves.index(cuve)
+                next_cuve = cuves[(idx + 1) % len(cuves)]
+                st.session_state["__next_cuve__"] = next_cuve
+                st.rerun()
 
-            sup_upsert_note(essai_id, cuve, degustateur.strip(), notes, commentaire)
-            sup_fetch_notes.clear()
-
-            # avance à la cuve suivante
-            st.session_state["deg_cuve_idx"] = (st.session_state["deg_cuve_idx"] + 1) % len(cuves_list)
-
-            st.success("Note enregistrée ✅ → cuve suivante")
-            st.rerun()
-
-
+        if "__next_cuve__" in st.session_state:
+            st.session_state.pop("__next_cuve__", None)
 
     with subtab2:
         refresh_s = st.slider("Refresh (secondes)", 1, 5, 2)
