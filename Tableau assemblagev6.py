@@ -1,19 +1,14 @@
+```python
 import streamlit as st
 import pandas as pd
 import numpy as np
 from datetime import datetime
 import tempfile
 import hashlib
-import json
 
 from openpyxl import load_workbook
 from openpyxl.styles import Font, Alignment, PatternFill, Border, Side
 from openpyxl.utils import get_column_letter
-
-# ====== NEW: Supabase + live dashboard deps ======
-from supabase import create_client
-import plotly.graph_objects as go
-from streamlit_autorefresh import st_autorefresh
 
 # ==========================================================
 # CONFIG / UI
@@ -34,7 +29,7 @@ st.markdown(
     unsafe_allow_html=True
 )
 
-st.title("🧪 Tableau Assemblage — avec gestion de stock + dégustation live")
+st.title("🧪 Tableau Assemblage — avec gestion de stock")
 st.markdown(
     """
     <span class="pill">C/N/M conservés</span>
@@ -42,118 +37,12 @@ st.markdown(
     <span class="pill">Récap % fiable</span>
     <span class="pill">Stocks décrémentés par Code Produit</span>
     <span class="pill">Anti double-application</span>
-    <span class="pill">Dégustation live (Supabase)</span>
+    <span class="pill">Rapprochement État vs Ledger</span>
     """,
     unsafe_allow_html=True
 )
 
 CEPAGE_LABEL = {"C": "Chardonnay", "N": "Pinot Noir", "M": "Meunier"}
-
-# ==========================================================
-# NEW: SUPABASE (Degustation) - helpers
-# ==========================================================
-@st.cache_resource
-def sb():
-    # Requiert dans Streamlit Secrets :
-    # SUPABASE_URL="..."
-    # SUPABASE_SERVICE_ROLE_KEY="..."
-    url = st.secrets.get("SUPABASE_URL", "")
-    key = st.secrets.get("SUPABASE_SERVICE_ROLE_KEY", "")
-    if not url or not key:
-        return None
-    return create_client(url, key)
-
-def supabase_ready():
-    return sb() is not None
-
-def sup_create_essai(nom: str, cuves: list[str]) -> str:
-    res = sb().table("essais").insert({"nom": nom, "cuves": cuves}).execute()
-    return res.data[0]["id"]
-
-def sup_list_essais(limit: int = 50) -> pd.DataFrame:
-    res = sb().table("essais").select("id,created_at,nom,cuves").order("created_at", desc=True).limit(limit).execute()
-    return pd.DataFrame(res.data)
-
-def sup_get_essai(essai_id: str) -> dict:
-    res = sb().table("essais").select("id,created_at,nom,cuves").eq("id", essai_id).single().execute()
-    return res.data
-
-def sup_upsert_note(essai_id: str, cuve: str, degustateur: str, notes: dict, commentaire: str):
-    row = {
-        "essai_id": essai_id,
-        "cuve": cuve,
-        "degustateur": degustateur,
-        **notes,
-        "commentaire": commentaire or "",
-    }
-    # Insert puis fallback update si déjà existant (unique index essai_id, cuve, degustateur)
-    try:
-        sb().table("notes").insert(row).execute()
-    except Exception:
-        sb().table("notes").update({**notes, "commentaire": commentaire or ""}) \
-            .eq("essai_id", essai_id).eq("cuve", cuve).eq("degustateur", degustateur).execute()
-
-@st.cache_data(ttl=2, show_spinner=False)
-def sup_fetch_notes(essai_id: str) -> pd.DataFrame:
-    res = sb().table("notes") \
-        .select("created_at,essai_id,cuve,degustateur,acidite,amertume,mineralite,volume,sucrosite,defaut,commentaire") \
-        .eq("essai_id", essai_id) \
-        .order("created_at", desc=False) \
-        .limit(5000) \
-        .execute()
-    df = pd.DataFrame(res.data)
-    if df.empty:
-        return df
-    for c in ["acidite", "amertume", "mineralite", "volume", "sucrosite", "defaut"]:
-        df[c] = pd.to_numeric(df[c], errors="coerce")
-    return df
-
-RADAR_AXES = ["Acidité", "Amertume", "Minéralité", "Volume", "Sucrosité", "Pureté"]  # Pureté = 6 - défaut
-
-def radar_fig(df_cuve: pd.DataFrame, by_taster: bool = False):
-    d = df_cuve.copy()
-    d["purete"] = 6 - d["defaut"]
-
-    mean_vals = [
-        d["acidite"].mean(),
-        d["amertume"].mean(),
-        d["mineralite"].mean(),
-        d["volume"].mean(),
-        d["sucrosite"].mean(),
-        d["purete"].mean(),
-    ]
-
-    fig = go.Figure()
-    fig.add_trace(go.Scatterpolar(
-        r=mean_vals + [mean_vals[0]],
-        theta=RADAR_AXES + [RADAR_AXES[0]],
-        fill="toself",
-        name="Moyenne",
-    ))
-
-    if by_taster:
-        for degust, g in d.groupby("degustateur"):
-            vals = [
-                g["acidite"].mean(),
-                g["amertume"].mean(),
-                g["mineralite"].mean(),
-                g["volume"].mean(),
-                g["sucrosite"].mean(),
-                g["purete"].mean(),
-            ]
-            fig.add_trace(go.Scatterpolar(
-                r=vals + [vals[0]],
-                theta=RADAR_AXES + [RADAR_AXES[0]],
-                name=str(degust),
-            ))
-
-    fig.update_layout(
-        margin=dict(l=10, r=10, t=25, b=10),
-        polar=dict(radialaxis=dict(visible=True, range=[1, 5], dtick=1)),
-        height=300,
-        showlegend=by_taster,
-    )
-    return fig
 
 # ==========================================================
 # HELPERS COMMUNS
@@ -183,27 +72,6 @@ def normalize_cuve_number(x):
     if 0 < v < 1:
         v = v * 10000
     return int(round(v))
-
-# ✅ NEW: robust conversion cuve -> int or None
-def cuve_to_int_or_none(x):
-    """
-    Convertit N° Cuve en int si possible, sinon None.
-    Gère NaN, "", "351.0", 351.0, etc.
-    """
-    if pd.isna(x):
-        return None
-    try:
-        if isinstance(x, str):
-            xs = x.strip().replace(" ", "").replace(",", ".")
-            if xs == "":
-                return None
-            x = xs
-        v = pd.to_numeric(x, errors="coerce")
-        if pd.isna(v):
-            return None
-        return int(round(float(v)))
-    except Exception:
-        return None
 
 def to_cepage_code(v):
     if pd.isna(v):
@@ -305,6 +173,10 @@ def build_delta_table(snapshot_df: pd.DataFrame, ledger_df: pd.DataFrame) -> pd.
 # ONGLET 2 : STOCK UPDATE
 # ==========================================================
 def build_stock_snapshot(df_stock):
+    """
+    Attend au minimum : Produit, En Stock
+    Produit = Code Produit en Cuve (logique stock)
+    """
     required = {"Produit", "En Stock"}
     if not required.issubset(set(df_stock.columns)):
         missing = sorted(list(required - set(df_stock.columns)))
@@ -369,9 +241,11 @@ def read_consumption_from_assemblage(assemblage_xlsx, essai="E1"):
     d["Code Produit en Cuve"] = d["Code Produit en Cuve"].apply(normalize_str)
     d[qty_col] = coerce_float(d[qty_col])
 
+    # Exclure titres/sous-totaux
     d = d[(d["Code Produit en Cuve"] != "") & (d["Code Produit en Cuve"].str.upper() != "SOUS-TOTAL")]
     d = d[d[qty_col].fillna(0) > 0].copy()
 
+    # ✅ nom de colonne avec espaces via **{...}
     cons = (
         d.groupby("Code Produit en Cuve", as_index=False)
         .agg(**{"Consommé (L)": (qty_col, "sum")})
@@ -402,6 +276,12 @@ def apply_consumption(ledger_df, cons_df):
     return updated
 
 def export_stock_with_highlight_and_journal(updated_df, cons_df, journal_df, ref_assemblage, date_conso):
+    """
+    Export Excel:
+    - STOCK_MAJ : lignes modifiées surlignées (Consommé (L) > 0)
+    - RECAP_CONSO : recap consommation + total
+    - JOURNAL : historique avec Fingerprint
+    """
     with tempfile.NamedTemporaryFile(delete=False, suffix=".xlsx") as tmp:
         out_path = tmp.name
 
@@ -436,6 +316,7 @@ def export_stock_with_highlight_and_journal(updated_df, cons_df, journal_df, ref
     thin = Side(style="thin", color="000000")
     border = Border(left=thin, right=thin, top=thin, bottom=thin)
 
+    # --- STOCK sheet title
     ws.insert_rows(1)
     ws.merge_cells("A1:E1")
     ws["A1"] = f"Stock mis à jour — {ref_assemblage} — {date_conso.strftime('%d/%m/%Y')}"
@@ -443,6 +324,7 @@ def export_stock_with_highlight_and_journal(updated_df, cons_df, journal_df, ref
     ws["A1"].alignment = Alignment(horizontal="center", vertical="center")
     ws.row_dimensions[1].height = 22
 
+    # Header row now 2
     for cell in ws[2]:
         cell.fill = header_fill
         cell.font = header_font
@@ -469,6 +351,7 @@ def export_stock_with_highlight_and_journal(updated_df, cons_df, journal_df, ref
             for c in range(1, ws.max_column + 1):
                 ws.cell(row=r, column=c).fill = changed_fill
 
+    # --- RECAP sheet style
     ws2.insert_rows(1)
     ws2.merge_cells("A1:B1")
     ws2["A1"] = "RÉCAP des quantités utilisées (assemblage)"
@@ -494,6 +377,7 @@ def export_stock_with_highlight_and_journal(updated_df, cons_df, journal_df, ref
             ws2[f"A{r}"].fill = PatternFill(start_color="FFD966", end_color="FFD966", fill_type="solid")
             ws2[f"B{r}"].fill = PatternFill(start_color="FFD966", end_color="FFD966", fill_type="solid")
 
+    # --- JOURNAL sheet style
     if ws3 is not None:
         for cell in ws3[1]:
             cell.fill = header_fill
@@ -535,14 +419,8 @@ def tab_assemblage():
         df_cuves["Produit"] = norm_str_series(df_cuves["Produit"])
     if "Cépage" in df_cuves.columns:
         df_cuves["Cépage"] = norm_str_series(df_cuves["Cépage"])
-
-    # ✅ Robustesse N° Cuve (fix crash)
     if "N° Cuve" in df_cuves.columns:
         df_cuves["N° Cuve"] = df_cuves["N° Cuve"].apply(normalize_cuve_number)
-        df_cuves["_cuve_int"] = df_cuves["N° Cuve"].apply(cuve_to_int_or_none)
-        df_cuves = df_cuves[df_cuves["_cuve_int"].notna()].copy()
-        df_cuves["N° Cuve"] = df_cuves["_cuve_int"].astype(int)
-        df_cuves.drop(columns=["_cuve_int"], inplace=True)
 
     for d in (df_codes, df_codes_ass):
         for col in ["Code Produit en Cuve", "Clé Produit en Cuve", "Libéllé Produit en Cuve"]:
@@ -666,17 +544,6 @@ def tab_assemblage():
         right_on="Code Produit en Cuve"
     )
 
-    # ✅ NEW: préparer la liste de cuves pour dégustation (plus de int(...))
-    cuves_for_tasting = (
-        df_selection[["N° Cuve", "Produit"]]
-        .drop_duplicates()
-        .sort_values(["N° Cuve", "Produit"])
-        .apply(lambda r: f"{r['N° Cuve']} - {str(r['Produit']).strip()}", axis=1)
-        .tolist()
-    )
-    st.session_state["last_cuves_for_tasting"] = cuves_for_tasting
-    st.session_state["last_titre_excel"] = st.session_state.get("titre_ass", "Assemblage")
-
     # Catégorie couleur (C/N/M/ASSEMBLAGE)
     df_selection["Catégorie couleur"] = df_selection.apply(
         lambda r: "ASSEMBLAGE" if str(r["Produit"]).strip() in set_assemblages else to_cepage_code(r["Cépage"]),
@@ -688,6 +555,7 @@ def tab_assemblage():
         lambda c: "Assemblage" if str(c).strip().upper() == "ASSEMBLAGE" else CEPAGE_LABEL.get(str(c).strip().upper(), str(c))
     )
 
+    # Année export: "" pour assemblage, int sinon
     def _annee_export(row):
         if str(row["Produit"]).strip() in set_assemblages:
             return ""
@@ -698,6 +566,7 @@ def tab_assemblage():
 
     df_selection["Année_export"] = df_selection.apply(_annee_export, axis=1)
 
+    # Flag réserve pour tri
     df_selection["Is_reserve"] = df_selection.apply(
         lambda r: 0 if str(r["Produit"]).strip() in set_assemblages else (1 if r["Type"] == "Vin de réserve" else 0),
         axis=1
@@ -727,6 +596,7 @@ def tab_assemblage():
         "Is_reserve",
     ]
 
+    # Tri: 2025.. puis réserves, assemblage dernier
     df_export["__cat_order"] = df_export["Catégorie couleur"].apply(lambda x: 1 if str(x).strip().upper() != "ASSEMBLAGE" else 3)
     df_export["__reserve_order"] = df_export["Is_reserve"].apply(lambda x: 2 if int(x) == 1 else 1)
 
@@ -749,6 +619,7 @@ def tab_assemblage():
         .drop(columns=["__cat_order", "__reserve_order", "__annee", "Is_reserve"])
     )
 
+    # SOMMAIRE
     df_sommaire = (
         df_export.groupby(["Cépage", "Année"], dropna=False)
         .agg(Nb_Cuves=("N° Cuve", "nunique"), Volume_L=("Volume_base", "sum"))
@@ -768,10 +639,10 @@ def tab_assemblage():
         "Volume_L": float(df_sommaire["Volume_L"].sum())
     }])], ignore_index=True)
 
+    # DF FINAL (avec essais)
     base_cols = ["Clé Produit en Cuve", "N° Cuve", "Code Produit en Cuve", "Libellé Produit en Cuve", "Cépage", "Année"]
     essais_cols = []
-    ESSAIS = int(st.session_state.get("essais_ass", 5))
-    for e in range(1, ESSAIS + 1):
+    for e in range(1, int(ESSAIS) + 1):
         c = essai_cols(e)
         essais_cols.extend([c["vol"], c["solde"], c["qty"], c["pct"], c["c250"], c["c500"]])
 
@@ -794,7 +665,7 @@ def tab_assemblage():
             row["Cépage"] = r["Cépage"]
             row["Année"] = r["Année"]
             row["Catégorie couleur"] = r["Catégorie couleur"]
-            for e in range(1, ESSAIS + 1):
+            for e in range(1, int(ESSAIS) + 1):
                 cc = essai_cols(e)
                 row[cc["vol"]] = r["Volume_base"]
             rows.append(row)
@@ -818,7 +689,7 @@ def tab_assemblage():
         ws = wb.active
 
         start_base_col = 7
-        last_visible_col = 6 + ESSAIS * 6
+        last_visible_col = 6 + int(ESSAIS) * 6
         last_visible_letter = get_column_letter(last_visible_col)
 
         tech_col_idx = last_visible_col + 1
@@ -826,8 +697,8 @@ def tab_assemblage():
 
         cuv_col = "B"
         ann_col = "F"
-        titre_excel = st.session_state.get("titre_ass", "Assemblage")
 
+        # Title
         ws.insert_rows(1)
         ws.merge_cells(f"A1:{last_visible_letter}1")
         ws["A1"] = titre_excel
@@ -837,6 +708,7 @@ def tab_assemblage():
 
         ws.column_dimensions[tech_col_letter].hidden = True
 
+        # Styles
         fill_vert = PatternFill(start_color="C6EFCE", end_color="C6EFCE", fill_type="solid")
         fill_rouge = PatternFill(start_color="FFC7CE", end_color="FFC7CE", fill_type="solid")
         fill_gris = PatternFill(start_color="D9D9D9", end_color="D9D9D9", fill_type="solid")
@@ -851,6 +723,7 @@ def tab_assemblage():
             bottom=Side(border_style="thick", color="000000")
         )
 
+        # Sommaire
         n = len(df_sommaire)
         ws.insert_rows(2, amount=(1 + 1 + n + 1))
         ws["A2"] = "SOMMAIRE"
@@ -873,6 +746,7 @@ def tab_assemblage():
         data_start_row = header_row + 1
         ws.freeze_panes = f"A{data_start_row}"
 
+        # Header style
         for c in range(1, last_visible_col + 1):
             cell = ws[f"{get_column_letter(c)}{header_row}"]
             cell.fill = fill_header
@@ -880,6 +754,7 @@ def tab_assemblage():
             cell.alignment = Alignment(horizontal="center", vertical="center")
         ws.row_dimensions[header_row].height = 20
 
+        # Column widths
         ws.column_dimensions["A"].width = 22
         ws.column_dimensions["B"].width = 10
         ws.column_dimensions["C"].width = 18
@@ -887,7 +762,7 @@ def tab_assemblage():
         ws.column_dimensions["E"].width = 14
         ws.column_dimensions["F"].width = 8
 
-        for e in range(1, ESSAIS + 1):
+        for e in range(1, int(ESSAIS) + 1):
             cols = excel_cols_for_essai(e, start_base_col=start_base_col)
             ws.column_dimensions[get_column_letter(cols["vol"])].width = 12
             ws.column_dimensions[get_column_letter(cols["solde"])].width = 11
@@ -896,15 +771,17 @@ def tab_assemblage():
             ws.column_dimensions[get_column_letter(cols["c250"])].width = 9
             ws.column_dimensions[get_column_letter(cols["c500"])].width = 9
 
+        # Formats
         for r in range(data_start_row, ws.max_row + 1):
             ws[f"B{r}"].number_format = "0"
 
         force_excel_years_to_int(ws, year_col_letter="F", cuve_col_letter="B", start_row=data_start_row, end_row=ws.max_row)
 
+        # Sous-totaux
         current_start = data_start_row
         for r in range(data_start_row, ws.max_row + 1):
             if ws[f"A{r}"].value == "Sous-total":
-                for e in range(1, ESSAIS + 1):
+                for e in range(1, int(ESSAIS) + 1):
                     cols = excel_cols_for_essai(e, start_base_col=start_base_col)
                     for col_idx in range(cols["vol"], cols["end"] + 1):
                         col_letter = get_column_letter(col_idx)
@@ -917,6 +794,7 @@ def tab_assemblage():
                             ws[f"{col_letter}{r}"].number_format = "0.00"
                 current_start = r + 1
 
+        # ✅ RÉCAP % (via colonne tech)
         recap_rows = [
             ("RÉCAP % - 2025 (Vin de l'année)", None),
             ("Chardonnay", "C"),
@@ -939,7 +817,7 @@ def tab_assemblage():
             ws[f"A{rr}"] = label
             ws[f"A{rr}"].font = Font(bold=True) if (key is None or str(key).startswith("__")) else Font(bold=False)
 
-            for e in range(1, ESSAIS + 1):
+            for e in range(1, int(ESSAIS) + 1):
                 cols = excel_cols_for_essai(e, start_base_col=start_base_col)
                 qty_col_letter = get_column_letter(cols["qty"])
                 pct_col_letter = get_column_letter(cols["pct"])
@@ -991,13 +869,14 @@ def tab_assemblage():
                     ws[f"{pct_col_letter}{rr}"] = f"=IF({denom_all}=0,0,{num}/{denom_all})"
                 ws[f"{pct_col_letter}{rr}"].number_format = "0.00%"
 
+        # TOTAL final
         dernier_row = ws.max_row + 1
         ws[f"A{dernier_row}"] = "TOTAL"
         ws[f"A{dernier_row}"].font = Font(bold=True, size=12)
         ws[f"A{dernier_row}"].fill = PatternFill(start_color="FFD966", end_color="FFD966", fill_type="solid")
         ws.merge_cells(start_row=dernier_row, start_column=1, end_row=dernier_row, end_column=6)
 
-        for e in range(1, ESSAIS + 1):
+        for e in range(1, int(ESSAIS) + 1):
             cols = excel_cols_for_essai(e, start_base_col=start_base_col)
             for col_idx in range(cols["vol"], cols["end"] + 1):
                 col_letter = get_column_letter(col_idx)
@@ -1015,23 +894,22 @@ def tab_assemblage():
                     else:
                         ws[f"{col_letter}{dernier_row}"].number_format = "0.00"
 
+        # Couleurs C/N/M + sous-total
         for r in range(data_start_row, ws.max_row + 1):
             cat = str(ws[f"{tech_col_letter}{r}"].value).strip().upper()
             if cat == "C":
-                for cell in ws[r]:
-                    cell.fill = fill_vert
+                for cell in ws[r]: cell.fill = fill_vert
             elif cat == "N":
-                for cell in ws[r]:
-                    cell.fill = fill_rouge
+                for cell in ws[r]: cell.fill = fill_rouge
             elif cat == "M" or "ASSEMBLAGE" in cat:
-                for cell in ws[r]:
-                    cell.fill = fill_gris
+                for cell in ws[r]: cell.fill = fill_gris
 
             if ws[f"A{r}"].value == "Sous-total":
                 for cell in ws[r]:
                     cell.fill = fill_sous_total
                     cell.font = Font(bold=True, color="FFA500")
 
+        # Titres blocs (merge)
         for r in range(data_start_row, ws.max_row + 1):
             val = ws[f"A{r}"].value
             cat_val = ws[f"{tech_col_letter}{r}"].value
@@ -1040,7 +918,8 @@ def tab_assemblage():
                 ws[f"A{r}"].font = Font(bold=True, size=13)
                 ws[f"A{r}"].alignment = Alignment(horizontal="left", vertical="center")
 
-        for e in range(1, ESSAIS + 1):
+        # Encadrer essais (bordures verticales épaisses)
+        for e in range(1, int(ESSAIS) + 1):
             cols = excel_cols_for_essai(e, start_base_col=start_base_col)
             left_letter = get_column_letter(cols["start"])
             right_letter = get_column_letter(cols["end"])
@@ -1052,6 +931,7 @@ def tab_assemblage():
                 cellR.border = Border(right=Side(border_style="thick", color="000000"),
                                      left=cellR.border.left, top=cellR.border.top, bottom=cellR.border.bottom)
 
+        # Bordures groupes (A..F + volume essai 1)
         groupe_debut = None
         for r in range(data_start_row, ws.max_row + 1):
             if ws[f"A{r}"].value not in ("Sous-total", "TOTAL", None, "") and ws[f"B{r}"].value not in (None, ""):
@@ -1063,6 +943,7 @@ def tab_assemblage():
                         cell.border = border_epaisse
                 groupe_debut = None
 
+        # Formules automatiques
         total_row = ws.max_row
         for r in range(data_start_row, total_row):
             if ws[f"A{r}"].value == "Sous-total":
@@ -1070,7 +951,7 @@ def tab_assemblage():
             if ws[f"B{r}"].value in (None, ""):
                 continue
 
-            for e in range(1, ESSAIS + 1):
+            for e in range(1, int(ESSAIS) + 1):
                 cols = excel_cols_for_essai(e, start_base_col=start_base_col)
                 vol = get_column_letter(cols["vol"])
                 solde = get_column_letter(cols["solde"])
@@ -1094,174 +975,8 @@ def tab_assemblage():
     with open(fichier_excel, "rb") as f:
         st.download_button("📥 Télécharger l'assemblage (Excel)", f, file_name="assemblage.xlsx", use_container_width=True)
 
-    # NEW: bouton pour créer un essai de dégustation directement
-    st.divider()
-    st.subheader("🍷 Dégustation (optionnel)")
-    if not supabase_ready():
-        st.info("Supabase non configuré (ajoute SUPABASE_URL + SUPABASE_SERVICE_ROLE_KEY dans st.secrets).")
-        return
-
-    cuves_for_tasting = st.session_state.get("last_cuves_for_tasting", [])
-    if cuves_for_tasting:
-        default_essai_name = f"{titre_excel} — {datetime.now().strftime('%Y-%m-%d %H:%M')}"
-        essai_name = st.text_input("Nom de l'essai dégustation", value=default_essai_name, key="essai_name_auto")
-
-        if st.button("✅ Créer l'essai dégustation (Supabase)", type="primary"):
-            essai_id = sup_create_essai(essai_name, cuves_for_tasting)
-            st.session_state["deg_essai_id"] = essai_id
-            st.success("Essai créé ✅ — va dans l’onglet 🍷 Dégustation Live")
-            sup_fetch_notes.clear()
-    else:
-        st.info("Aucune cuve en session pour créer un essai.")
-
 # ==========================================================
-# ONGLET 2 bis : DEGUSTATION LIVE (SUPABASE)
-# ==========================================================
-def tab_degustation_live():
-    st.subheader("🍷 Dégustation Live (multi-dégustateurs, consolidation auto)")
-
-    if not supabase_ready():
-        st.error("Supabase non configuré. Ajoute SUPABASE_URL et SUPABASE_SERVICE_ROLE_KEY dans les Secrets Streamlit.")
-        st.stop()
-
-    st.markdown(
-        """
-        <div class="card">
-          <div><b>Principe :</b> chaque note est enregistrée en base (Supabase). Le dashboard se met à jour automatiquement.</div>
-          <div class="small">Pureté = 6 - Défaut (pour que “plus grand = mieux” sur l’araignée).</div>
-        </div>
-        """,
-        unsafe_allow_html=True
-    )
-
-    df_ess = sup_list_essais()
-    current = st.session_state.get("deg_essai_id", "")
-
-    c1, c2 = st.columns([1.6, 1])
-    with c1:
-        if df_ess.empty:
-            st.info("Aucun essai. Crée-en un depuis l’onglet Assemblage (bouton dégustation) ou ci-dessous.")
-        else:
-            df_ess["label"] = df_ess.apply(lambda r: f"{r['nom']}  —  {r['created_at']}", axis=1)
-            options = dict(zip(df_ess["label"], df_ess["id"]))
-            default_idx = 0
-            if current and current in df_ess["id"].tolist():
-                default_idx = df_ess["id"].tolist().index(current)
-
-            chosen_label = st.selectbox("Essai à utiliser", list(options.keys()), index=default_idx)
-            chosen_id = options[chosen_label]
-            st.session_state["deg_essai_id"] = chosen_id
-
-    with c2:
-        st.caption("Créer un essai manuellement (si besoin)")
-        default_name = f"Essai {datetime.now().strftime('%Y-%m-%d %H:%M')}"
-        nom = st.text_input("Nom", value=default_name, key="manual_essai_name")
-        cuves_txt = st.text_area("Cuves (1 par ligne)", height=100, key="manual_cuves")
-        cuves = [x.strip() for x in cuves_txt.splitlines() if x.strip()]
-        if st.button("➕ Créer essai (manuel)"):
-            if not cuves:
-                st.error("Ajoute au moins une cuve.")
-            else:
-                new_id = sup_create_essai(nom, cuves)
-                st.session_state["deg_essai_id"] = new_id
-                st.success("Essai créé ✅")
-                sup_fetch_notes.clear()
-
-    essai_id = st.session_state.get("deg_essai_id", "")
-    if not essai_id:
-        st.stop()
-
-    essai = sup_get_essai(essai_id)
-    cuves = essai.get("cuves", [])
-    st.caption(f"Essai : **{essai.get('nom','')}** — {len(cuves)} cuve(s)")
-
-    subtab1, subtab2 = st.tabs(["📝 Saisie dégustateur", "📡 Dashboard live"])
-
-    with subtab1:
-        colA, colB = st.columns([1, 1])
-        with colA:
-            degustateur = st.text_input("Dégustateur", value=st.session_state.get("degustateur", ""))
-            if degustateur:
-                st.session_state["degustateur"] = degustateur
-        with colB:
-            cuve = st.selectbox("Cuve", cuves) if cuves else st.selectbox("Cuve", ["(aucune)"])
-
-        c1, c2, c3 = st.columns(3)
-        with c1:
-            acidite = st.slider("Acidité", 1, 5, 3)
-            amertume = st.slider("Amertume", 1, 5, 3)
-        with c2:
-            mineralite = st.slider("Minéralité", 1, 5, 3)
-            volume = st.slider("Volume", 1, 5, 3)
-        with c3:
-            sucrosite = st.slider("Sucrosité", 1, 5, 3)
-            defaut = st.slider("Défaut (1=aucun, 5=fort)", 1, 5, 1)
-
-        commentaire = st.text_area("Commentaire", height=100)
-
-        if st.button("✅ Envoyer / Mettre à jour", type="primary"):
-            if not degustateur.strip():
-                st.error("Renseigne le nom du dégustateur.")
-            else:
-                notes = {
-                    "acidite": acidite,
-                    "amertume": amertume,
-                    "mineralite": mineralite,
-                    "volume": volume,
-                    "sucrosite": sucrosite,
-                    "defaut": defaut,
-                }
-                sup_upsert_note(essai_id, cuve, degustateur.strip(), notes, commentaire)
-                st.success("Note enregistrée ✅")
-                sup_fetch_notes.clear()
-
-        if st.button("➡️ Cuve suivante"):
-            if cuves:
-                idx = cuves.index(cuve)
-                next_cuve = cuves[(idx + 1) % len(cuves)]
-                st.session_state["__next_cuve__"] = next_cuve
-                st.rerun()
-
-        if "__next_cuve__" in st.session_state:
-            st.session_state.pop("__next_cuve__", None)
-
-    with subtab2:
-        refresh_s = st.slider("Refresh (secondes)", 1, 5, 2)
-        by_taster = st.checkbox("Afficher aussi par dégustateur", value=False)
-
-        st_autorefresh(interval=refresh_s * 1000, key="deg_live_refresh")
-
-        df = sup_fetch_notes(essai_id)
-        if df.empty:
-            st.info("Aucune note pour le moment.")
-            st.stop()
-
-        st.caption(f"{len(df)} note(s) — {df['cuve'].nunique()} cuve(s) — {df['degustateur'].nunique()} dégustateur(s)")
-
-        cuves_with_data = [c for c in cuves if c in set(df["cuve"].dropna())]
-        cuves_no_data = [c for c in cuves if c not in set(df["cuve"].dropna())]
-        if cuves_no_data:
-            st.caption("Sans notes : " + ", ".join(cuves_no_data))
-
-        for i in range(0, len(cuves_with_data), 3):
-            cols = st.columns(3)
-            for j in range(3):
-                if i + j >= len(cuves_with_data):
-                    break
-                cuv = cuves_with_data[i + j]
-                dcuve = df[df["cuve"] == cuv]
-                with cols[j]:
-                    st.markdown(f"**Cuve : {cuv}**  \nVotes : {len(dcuve)}")
-                    st.plotly_chart(radar_fig(dcuve, by_taster=by_taster), use_container_width=True)
-
-        with st.expander("💬 Commentaires"):
-            st.dataframe(
-                df[["created_at", "cuve", "degustateur", "commentaire"]].sort_values("created_at", ascending=False),
-                use_container_width=True
-            )
-
-# ==========================================================
-# ONGLET 3 : STOCK UPDATE (ANTI DOUBLE + DELTA + EXPORT)
+# ONGLET 2 : STOCK UPDATE (ANTI DOUBLE + DELTA + EXPORT)
 # ==========================================================
 def tab_stock_update():
     st.subheader("📦 Mise à jour des stocks (anti double-application + rapprochement)")
@@ -1303,9 +1018,11 @@ def tab_stock_update():
         return
 
     try:
+        # Snapshot état stocks
         df_stock = pd.read_excel(stock_file)
         snapshot = build_stock_snapshot(df_stock)
 
+        # Ledger + journal existant
         existing_journal = None
         if ledger_file:
             ledger = read_ledger(ledger_file)
@@ -1316,6 +1033,7 @@ def tab_stock_update():
             existing_journal = None
             st.warning("Aucun ledger fourni → initialisation depuis l'état des stocks.")
 
+        # Fingerprint anti double
         assemblage_bytes = assemblage_file.getvalue()
         fp = make_fingerprint(assemblage_bytes, essai=essai, ref=ref_assemblage, date_conso=date_conso)
 
@@ -1323,6 +1041,7 @@ def tab_stock_update():
             st.error("⛔ Cet assemblage a déjà été appliqué au stock (même fichier + essai + ref + date).")
             st.stop()
 
+        # Conso depuis assemblage
         cons = read_consumption_from_assemblage(assemblage_file, essai=essai)
 
         x1, x2, x3 = st.columns(3)
@@ -1333,6 +1052,7 @@ def tab_stock_update():
         st.markdown("### 🧾 Récap consommation (par code produit)")
         st.dataframe(cons, use_container_width=True)
 
+        # Application
         updated = apply_consumption(ledger, cons)
         issues = updated[updated["Surconsommation (L)"] > 0].copy()
 
@@ -1345,6 +1065,7 @@ def tab_stock_update():
         st.markdown("### 📌 Aperçu stock à jour")
         st.dataframe(updated.drop(columns=["Surconsommation (L)"]), use_container_width=True)
 
+        # Journal (append)
         journal_new = cons.copy()
         journal_new["Date"] = pd.to_datetime(date_conso)
         journal_new["Référence"] = ref_assemblage
@@ -1373,6 +1094,7 @@ def tab_stock_update():
             st.warning("⚠️ Des écarts importants existent (transferts, pertes, snapshot différent du théorique).")
             st.dataframe(delta_alert.head(200), use_container_width=True)
 
+        # Export
         out_path = export_stock_with_highlight_and_journal(
             updated_df=updated,
             cons_df=cons,
@@ -1395,13 +1117,11 @@ def tab_stock_update():
 # ==========================================================
 # ROUTING
 # ==========================================================
-tab1, tab2, tab3 = st.tabs(["🧪 Assemblage", "🍷 Dégustation Live", "📦 Mise à jour stocks"])
+tab1, tab2 = st.tabs(["🧪 Assemblage", "📦 Mise à jour stocks"])
 
 with tab1:
     tab_assemblage()
 
 with tab2:
-    tab_degustation_live()
-
-with tab3:
     tab_stock_update()
+```
