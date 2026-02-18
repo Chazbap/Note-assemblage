@@ -249,6 +249,98 @@ def build_scores_table(df: pd.DataFrame) -> pd.DataFrame:
     scores = scores.sort_values(["score_global", "votes"], ascending=[False, False])
     return scores
 
+def build_taster_profiles(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Profil moyen par dégustateur sur les 6 critères.
+    Retourne: degustateur + 6 critères + nb_notes + nb_cuves
+    """
+    if df.empty:
+        return pd.DataFrame()
+
+    d = df.copy()
+    d["purete"] = 6 - d["defaut"]
+
+    prof = (
+        d.groupby("degustateur", as_index=False)
+        .agg(
+            acidite=("acidite", "mean"),
+            amertume=("amertume", "mean"),
+            mineralite=("mineralite", "mean"),
+            volume=("volume", "mean"),
+            sucrosite=("sucrosite", "mean"),
+            purete=("purete", "mean"),
+            nb_notes=("cuve", "size"),
+            nb_cuves=("cuve", "nunique"),
+        )
+    )
+
+    for c in ["acidite", "amertume", "mineralite", "volume", "sucrosite", "purete"]:
+        prof[c] = prof[c].round(2)
+
+    prof["score_global"] = prof[["acidite", "amertume", "mineralite", "volume", "sucrosite", "purete"]].mean(axis=1).round(2)
+    prof = prof.sort_values(["nb_notes", "nb_cuves"], ascending=[False, False])
+    return prof
+
+
+def taster_distance_to_reference(profiles: pd.DataFrame, ref_taster: str):
+    """
+    Bar chart : distance euclidienne (6 critères) vs dégustateur de référence.
+    """
+    if profiles.empty or not ref_taster or ref_taster not in set(profiles["degustateur"]):
+        return None
+
+    criteria = ["acidite", "amertume", "mineralite", "volume", "sucrosite", "purete"]
+    m = profiles.set_index("degustateur")[criteria]
+    ref = m.loc[ref_taster].to_numpy()
+    dist = ((m.to_numpy() - ref) ** 2).sum(axis=1) ** 0.5
+    dist = pd.Series(dist, index=m.index).sort_values()
+
+    fig = go.Figure(
+        data=go.Bar(
+            x=dist.values,
+            y=dist.index.astype(str).tolist(),
+            orientation="h",
+        )
+    )
+    fig.update_layout(
+        height=min(900, 120 + 26 * len(dist)),
+        margin=dict(l=10, r=10, t=35, b=10),
+        xaxis_title="Distance (écart global)",
+        yaxis_title="Dégustateur",
+        title=f"Écart global vs {ref_taster} (6 critères)",
+    )
+    return fig
+
+
+def plot_taster_distance_matrix(profiles: pd.DataFrame):
+    """
+    Heatmap distance dégustateur x dégustateur (plus petit = plus proche).
+    """
+    if profiles.empty or len(profiles) < 2:
+        return None
+
+    criteria = ["acidite", "amertume", "mineralite", "volume", "sucrosite", "purete"]
+    names = profiles["degustateur"].astype(str).tolist()
+    X = profiles[criteria].to_numpy()
+
+    # matrice distances euclidiennes
+    D = np.sqrt(((X[:, None, :] - X[None, :, :]) ** 2).sum(axis=2))
+
+    fig = go.Figure(
+        data=go.Heatmap(
+            z=D,
+            x=names,
+            y=names,
+            colorbar=dict(title="Distance"),
+        )
+    )
+    fig.update_layout(
+        height=min(900, 200 + 28 * len(names)),
+        margin=dict(l=10, r=10, t=35, b=10),
+        title="Distances entre dégustateurs (6 critères)",
+    )
+    return fig
+
 def plot_heatmap_scores(scores: pd.DataFrame):
     # Heatmap (cuves x critères)
     if scores.empty:
@@ -1510,6 +1602,35 @@ def tab_degustation_live():
                 df[["created_at", "cuve", "degustateur", "commentaire"]].sort_values("created_at", ascending=False),
                 use_container_width=True
             )
+        st.markdown("## 👤 Performance / profil des dégustateurs")
+
+profiles = build_taster_profiles(df)
+
+# option: filtrer les dégustateurs avec trop peu de notes (évite les profils “instables”)
+min_notes = st.slider("Minimum de notes par dégustateur", 1, 20, 3, key=f"min_notes_{chosen_id}")
+profiles_f = profiles[profiles["nb_notes"] >= int(min_notes)].copy()
+
+if profiles_f.empty:
+    st.info("Pas assez de données pour analyser les dégustateurs (augmente le nombre de notes).")
+else:
+    st.markdown("### Profils moyens par dégustateur")
+    st.dataframe(profiles_f, use_container_width=True)
+
+    st.markdown("### Qui est proche / loin d’un dégustateur de référence")
+    ref_taster = st.selectbox(
+        "Choisir un dégustateur de référence",
+        profiles_f["degustateur"].astype(str).tolist(),
+        key=f"ref_taster_{chosen_id}",
+    )
+    fig_t = taster_distance_to_reference(profiles_f, ref_taster)
+    if fig_t is not None:
+        st.plotly_chart(fig_t, use_container_width=True, key=f"taster_dist_{chosen_id}_{ref_taster}")
+
+    st.markdown("### Matrice des distances entre dégustateurs")
+    mat_fig = plot_taster_distance_matrix(profiles_f)
+    if mat_fig is not None:
+        st.plotly_chart(mat_fig, use_container_width=True, key=f"taster_matrix_{chosen_id}")
+
 
 # ==========================================================
 # ONGLET 3 : STOCK UPDATE (ANTI DOUBLE + DELTA + EXPORT)
@@ -1656,3 +1777,4 @@ with tab2:
 
 with tab3:
     tab_stock_update()
+
