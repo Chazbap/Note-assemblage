@@ -1603,33 +1603,32 @@ def tab_degustation_live():
                 use_container_width=True
             )
         st.markdown("## 👤 Performance / profil des dégustateurs")
-
-profiles = build_taster_profiles(df)
-
-# option: filtrer les dégustateurs avec trop peu de notes (évite les profils “instables”)
-min_notes = st.slider("Minimum de notes par dégustateur", 1, 20, 3, key=f"min_notes_{chosen_id}")
-profiles_f = profiles[profiles["nb_notes"] >= int(min_notes)].copy()
-
-if profiles_f.empty:
-    st.info("Pas assez de données pour analyser les dégustateurs (augmente le nombre de notes).")
-else:
-    st.markdown("### Profils moyens par dégustateur")
-    st.dataframe(profiles_f, use_container_width=True)
-
-    st.markdown("### Qui est proche / loin d’un dégustateur de référence")
-    ref_taster = st.selectbox(
-        "Choisir un dégustateur de référence",
-        profiles_f["degustateur"].astype(str).tolist(),
-        key=f"ref_taster_{chosen_id}",
-    )
-    fig_t = taster_distance_to_reference(profiles_f, ref_taster)
-    if fig_t is not None:
-        st.plotly_chart(fig_t, use_container_width=True, key=f"taster_dist_{chosen_id}_{ref_taster}")
-
-    st.markdown("### Matrice des distances entre dégustateurs")
-    mat_fig = plot_taster_distance_matrix(profiles_f)
-    if mat_fig is not None:
-        st.plotly_chart(mat_fig, use_container_width=True, key=f"taster_matrix_{chosen_id}")
+        profiles = build_taster_profiles(df)
+        
+        # option: filtrer les dégustateurs avec trop peu de notes (évite les profils “instables”)
+        min_notes = st.slider("Minimum de notes par dégustateur", 1, 20, 3, key=f"min_notes_{chosen_id}")
+        profiles_f = profiles[profiles["nb_notes"] >= int(min_notes)].copy()
+        
+        if profiles_f.empty:
+            st.info("Pas assez de données pour analyser les dégustateurs (augmente le nombre de notes).")
+        else:
+            st.markdown("### Profils moyens par dégustateur")
+            st.dataframe(profiles_f, use_container_width=True)
+        
+            st.markdown("### Qui est proche / loin d’un dégustateur de référence")
+            ref_taster = st.selectbox(
+                "Choisir un dégustateur de référence",
+                profiles_f["degustateur"].astype(str).tolist(),
+                key=f"ref_taster_{chosen_id}",
+            )
+            fig_t = taster_distance_to_reference(profiles_f, ref_taster)
+            if fig_t is not None:
+                st.plotly_chart(fig_t, use_container_width=True, key=f"taster_dist_{chosen_id}_{ref_taster}")
+        
+            st.markdown("### Matrice des distances entre dégustateurs")
+            mat_fig = plot_taster_distance_matrix(profiles_f)
+            if mat_fig is not None:
+                st.plotly_chart(mat_fig, use_container_width=True, key=f"taster_matrix_{chosen_id}")
 
 
 # ==========================================================
@@ -1777,4 +1776,5 @@ with tab2:
 
 with tab3:
     tab_stock_update()
+
 
