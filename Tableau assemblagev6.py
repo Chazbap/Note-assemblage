@@ -1278,6 +1278,7 @@ def tab_assemblage():
 
 # ==========================================================
 # ONGLET 2 : DEGUSTATION LIVE (SUPABASE) + COMPARAISON
+# (CORRIGÉ : radio au lieu de tabs + keys uniques plotly)
 # ==========================================================
 def tab_degustation_live():
     st.subheader("🍷 Dégustation Live (multi-dégustateurs, consolidation, PIN)")
@@ -1318,7 +1319,7 @@ def tab_degustation_live():
     elif current and current in ids:
         default_idx = ids.index(current)
 
-    chosen_label = st.selectbox("Essai à utiliser", df_ess["label"].tolist(), index=default_idx)
+    chosen_label = st.selectbox("Essai à utiliser", df_ess["label"].tolist(), index=default_idx, key="essai_select")
     chosen_id = df_ess.loc[df_ess["label"] == chosen_label, "id"].values[0]
     st.session_state["deg_essai_id"] = chosen_id
 
@@ -1333,8 +1334,14 @@ def tab_degustation_live():
     if chosen_id not in st.session_state["authorized_essais"]:
         with st.expander("🔐 Accès dégustateurs (PIN)", expanded=True):
             pin_default = st.session_state.get("deg_pin_last", "") if qp_essai else ""
-            pin = st.text_input("PIN", value=pin_default, type="password", help="Demande le PIN au créateur de l’essai.")
-            if st.button("Déverrouiller l’essai"):
+            pin = st.text_input(
+                "PIN",
+                value=pin_default,
+                type="password",
+                help="Demande le PIN au créateur de l’essai.",
+                key=f"pin_{chosen_id}",
+            )
+            if st.button("Déverrouiller l’essai", key=f"unlock_{chosen_id}"):
                 if sup_check_pin(essai, pin):
                     st.session_state["authorized_essais"].add(chosen_id)
                     st.success("OK ✅ Essai déverrouillé")
@@ -1343,12 +1350,18 @@ def tab_degustation_live():
                     st.error("PIN incorrect.")
         st.stop()
 
-    subtab1, subtab2 = st.tabs(["📝 Saisie dégustateur", "📡 Dashboard live + comparaison"])
+    # ✅ IMPORTANT : ne plus utiliser st.tabs ici (les 2 blocs s'exécutent à chaque rerun).
+    view = st.radio(
+        "Vue",
+        ["📝 Saisie dégustateur", "📡 Dashboard live + comparaison"],
+        horizontal=True,
+        key=f"deg_view_{chosen_id}",
+    )
 
     # ---------------------------
-    # SUBTAB 1: Saisie (FORM + retry + verrou)
+    # VUE 1: Saisie (FORM + retry + verrou)
     # ---------------------------
-    with subtab1:
+    if view == "📝 Saisie dégustateur":
         if "saving_note" not in st.session_state:
             st.session_state["saving_note"] = False
         if "current_cuve_idx" not in st.session_state:
@@ -1356,35 +1369,41 @@ def tab_degustation_live():
 
         colA, colB, colC = st.columns([1.1, 1.1, 0.8])
         with colA:
-            degustateur = st.text_input("Dégustateur", value=st.session_state.get("degustateur", ""))
+            degustateur = st.text_input(
+                "Dégustateur",
+                value=st.session_state.get("degustateur", ""),
+                key=f"degustateur_{chosen_id}",
+            )
             if degustateur:
                 st.session_state["degustateur"] = degustateur
+
         with colB:
             if cuves:
                 idx = int(st.session_state.get("current_cuve_idx", 0)) % max(1, len(cuves))
-                cuve = st.selectbox("Cuve", cuves, index=idx, key="cuve_selectbox")
+                cuve = st.selectbox("Cuve", cuves, index=idx, key=f"cuve_select_{chosen_id}")
             else:
-                cuve = st.selectbox("Cuve", ["(aucune)"])
+                cuve = st.selectbox("Cuve", ["(aucune)"], key=f"cuve_select_{chosen_id}_none")
+
         with colC:
             if cuves:
                 st.caption("Navigation cuves")
-                if st.button("➡️ Cuve suivante", use_container_width=True):
+                if st.button("➡️ Cuve suivante", use_container_width=True, key=f"next_cuve_{chosen_id}"):
                     st.session_state["current_cuve_idx"] = (int(st.session_state["current_cuve_idx"]) + 1) % len(cuves)
                     st.rerun()
 
-        with st.form("form_note", clear_on_submit=False):
+        with st.form(f"form_note_{chosen_id}", clear_on_submit=False):
             c1, c2, c3 = st.columns(3)
             with c1:
-                acidite = st.slider("Acidité", 1, 5, 3)
-                amertume = st.slider("Amertume", 1, 5, 3)
+                acidite = st.slider("Acidité", 1, 5, 3, key=f"acidite_{chosen_id}")
+                amertume = st.slider("Amertume", 1, 5, 3, key=f"amertume_{chosen_id}")
             with c2:
-                mineralite = st.slider("Minéralité", 1, 5, 3)
-                volume = st.slider("Volume", 1, 5, 3)
+                mineralite = st.slider("Minéralité", 1, 5, 3, key=f"mineralite_{chosen_id}")
+                volume = st.slider("Volume", 1, 5, 3, key=f"volume_{chosen_id}")
             with c3:
-                sucrosite = st.slider("Sucrosité", 1, 5, 3)
-                defaut = st.slider("Défaut (1=aucun, 5=fort)", 1, 5, 1)
+                sucrosite = st.slider("Sucrosité", 1, 5, 3, key=f"sucrosite_{chosen_id}")
+                defaut = st.slider("Défaut (1=aucun, 5=fort)", 1, 5, 1, key=f"defaut_{chosen_id}")
 
-            commentaire = st.text_area("Commentaire", height=90)
+            commentaire = st.text_area("Commentaire", height=90, key=f"comment_{chosen_id}")
 
             submitted = st.form_submit_button(
                 "✅ Envoyer / Mettre à jour",
@@ -1426,17 +1445,21 @@ def tab_degustation_live():
                     st.error(f"Erreur Supabase (réseau/timeout possible) : {err}")
 
     # ---------------------------
-    # SUBTAB 2: Dashboard (autorefresh uniquement ici)
+    # VUE 2: Dashboard (autorefresh uniquement ici)
     # ---------------------------
-    with subtab2:
+    else:
         left, right = st.columns([1, 1])
         with left:
-            refresh_s = st.slider("Refresh (secondes)", 1, 10, 2)
+            refresh_s = st.slider("Refresh (secondes)", 1, 10, 2, key=f"refresh_{chosen_id}")
         with right:
-            by_taster = st.checkbox("Araignées : afficher aussi par dégustateur", value=False)
+            by_taster = st.checkbox(
+                "Araignées : afficher aussi par dégustateur",
+                value=False,
+                key=f"by_taster_{chosen_id}",
+            )
 
-        # IMPORTANT: autorefresh seulement ici
-        st_autorefresh(interval=refresh_s * 1000, key="deg_live_refresh")
+        # ✅ autorefresh uniquement quand on est sur le dashboard
+        st_autorefresh(interval=int(refresh_s) * 1000, key=f"deg_live_refresh_{chosen_id}")
 
         df = sup_fetch_notes(chosen_id)
         if df.empty:
@@ -1460,7 +1483,12 @@ def tab_degustation_live():
                 dcuve = df[df["cuve"] == cuv]
                 with cols[j]:
                     st.markdown(f"**Cuve : {cuv}**  \nVotes : {len(dcuve)}")
-                    st.plotly_chart(radar_fig(dcuve, by_taster=by_taster), use_container_width=True)
+                    fig = radar_fig(dcuve, by_taster=by_taster)
+                    st.plotly_chart(
+                        fig,
+                        use_container_width=True,
+                        key=f"radar_{chosen_id}_{cuv}_{'t' if by_taster else 'm'}",
+                    )
 
         st.markdown("### 📊 Comparaison cuves (moyennes consolidées)")
         scores = build_scores_table(df)
@@ -1468,14 +1496,14 @@ def tab_degustation_live():
 
         hm = plot_heatmap_scores(scores)
         if hm is not None:
-            st.plotly_chart(hm, use_container_width=True)
+            st.plotly_chart(hm, use_container_width=True, key=f"hm_{chosen_id}")
 
         st.markdown("### 📏 Mesurer l’écart entre cuves")
         st.caption("Distance = écart global sur les 6 critères (Acidité, Amertume, Minéralité, Volume, Sucrosité, Pureté).")
-        ref_cuve = st.selectbox("Choisir une cuve de référence", scores["cuve"].astype(str).tolist())
+        ref_cuve = st.selectbox("Choisir une cuve de référence", scores["cuve"].astype(str).tolist(), key=f"ref_{chosen_id}")
         dist_fig = plot_distance_to_reference(scores, ref_cuve)
         if dist_fig is not None:
-            st.plotly_chart(dist_fig, use_container_width=True)
+            st.plotly_chart(dist_fig, use_container_width=True, key=f"dist_{chosen_id}_{ref_cuve}")
 
         with st.expander("💬 Commentaires"):
             st.dataframe(
