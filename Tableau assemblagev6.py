@@ -392,6 +392,164 @@ def plot_distance_to_reference(scores: pd.DataFrame, ref_cuve: str):
         title=f"Écart global vs {ref_cuve} (6 critères)",
     )
     return fig
+def find_header_row_ws(ws, required_headers=("Produit", "En Stock", "N° Cuve"), max_scan=80):
+    """
+    Trouve la ligne d'en-tête dans une feuille openpyxl en scannant les premières lignes.
+    Retourne (header_row_index, header_map) où header_map = {header_name: col_idx}.
+    """
+    req = set(required_headers)
+    for r in range(1, min(max_scan, ws.max_row) + 1):
+        vals = []
+        for c in range(1, ws.max_column + 1):
+            v = ws.cell(row=r, column=c).value
+            vals.append(str(v).strip() if v is not None else "")
+        headers = {v for v in vals if v}
+        if req.issubset(headers):
+            header_map = {}
+            for c in range(1, ws.max_column + 1):
+                v = ws.cell(row=r, column=c).value
+                if v is None:
+                    continue
+                v = str(v).strip()
+                if v in req:
+                    header_map[v] = c
+            return r, header_map
+    return None, None
+
+
+def read_consumption_by_cuve_and_code(assemblage_xlsx, essai="E1") -> pd.DataFrame:
+    """
+    Lit la conso de l'assemblage par (N° Cuve, Code Produit en Cuve).
+    Retourne colonnes: N° Cuve (int), Code Produit en Cuve (str), Consommé (L) (float)
+    """
+    header_row = find_header_row(assemblage_xlsx, needle="Clé Produit en Cuve")
+    if header_row is None:
+        raise ValueError("Impossible de trouver l'en-tête du tableau dans l'assemblage (Clé Produit en Cuve).")
+
+    df = pd.read_excel(assemblage_xlsx, header=header_row)
+
+    qty_col = f"Quantité utilisée {essai}"
+    needed = {"N° Cuve", "Code Produit en Cuve", qty_col}
+    missing = needed - set(df.columns)
+    if missing:
+        raise ValueError(f"Colonnes manquantes dans l'assemblage pour {essai}: {sorted(missing)}")
+
+    d = df.copy()
+    d["Code Produit en Cuve"] = d["Code Produit en Cuve"].apply(normalize_str)
+    d["N° Cuve"] = d["N° Cuve"].apply(cuve_to_int_or_none)
+    d[qty_col] = coerce_float(d[qty_col]).fillna(0.0)
+
+    # Nettoyage: ignore titres / sous-totaux / lignes vides
+    d = d[d["N° Cuve"].notna()].copy()
+    d = d[(d["Code Produit en Cuve"] != "") & (d["Code Produit en Cuve"].str.upper() != "SOUS-TOTAL")].copy()
+    d = d[d[qty_col] > 0].copy()
+
+    cons = (
+        d.groupby(["N° Cuve", "Code Produit en Cuve"], as_index=False)
+        .agg(**{"Consommé (L)": (qty_col, "sum")})
+    )
+    cons["N° Cuve"] = cons["N° Cuve"].astype(int)
+    cons["Consommé (L)"] = cons["Consommé (L)"].round(2)
+    return cons
+
+
+def export_cuverie_with_updated_stock_keep_format(
+    cuverie_file,          # streamlit UploadedFile
+    assemblage_file,       # streamlit UploadedFile
+    essai="E1",
+    highlight=True,
+) -> str:
+    """
+    Ouvre le fichier cuverie ORIGINAL (conserve mise en forme),
+    décrémente 'En Stock' par (N° Cuve, Produit) selon l'assemblage (Quantité utilisée Ex),
+    puis exporte un nouveau xlsx.
+    """
+    # Conso par cuve+code
+    cons = read_consumption_by_cuve_and_code(assemblage_file, essai=essai)
+    if cons.empty:
+        raise ValueError(f"Aucune consommation détectée dans l'assemblage pour {essai}.")
+
+    cons_map = {
+        (int(r["N° Cuve"]), str(r["Code Produit en Cuve"]).strip()): float(r["Consommé (L)"])
+        for _, r in cons.iterrows()
+    }
+
+    # Sauver le fichier cuverie en local pour openpyxl
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".xlsx") as tmp:
+        cuv_path = tmp.name
+        tmp.write(cuverie_file.getvalue())
+
+    wb = load_workbook(cuv_path)
+
+    # Style de surlignage (optionnel)
+    changed_fill = PatternFill(start_color="FFF2CC", end_color="FFF2CC", fill_type="solid")
+
+    total_updates = 0
+    total_rows_seen = 0
+
+    for ws in wb.worksheets:
+        header_row, hmap = find_header_row_ws(ws, required_headers=("Produit", "En Stock", "N° Cuve"))
+        if header_row is None:
+            continue  # feuille qui ne ressemble pas à une cuverie
+
+        col_produit = hmap["Produit"]
+        col_stock = hmap["En Stock"]
+        col_cuve = hmap["N° Cuve"]
+
+        # Parcours des lignes de données jusqu'à fin
+        for r in range(header_row + 1, ws.max_row + 1):
+            produit = ws.cell(row=r, column=col_produit).value
+            cuve = ws.cell(row=r, column=col_cuve).value
+            stock_cell = ws.cell(row=r, column=col_stock)
+
+            # Stop si ligne vide "forte" (à adapter si besoin)
+            if produit in (None, "") and cuve in (None, ""):
+                # on ne break pas forcément car certains fichiers ont des blocs plus loin,
+                # mais si tu veux, tu peux mettre un break après X lignes vides.
+                continue
+
+            total_rows_seen += 1
+
+            prod_key = normalize_str(produit)
+            cuv_int = cuve_to_int_or_none(cuve)
+            if not prod_key or cuv_int is None:
+                continue
+
+            key = (int(cuv_int), prod_key)
+            used = cons_map.get(key, 0.0)
+            if used <= 0:
+                continue
+
+            old = stock_cell.value
+            old_f = pd.to_numeric(old, errors="coerce")
+            if pd.isna(old_f):
+                old_f = 0.0
+
+            new_stock = float(old_f) - float(used)
+            if new_stock < 0:
+                new_stock = 0.0
+
+            # Ecrire la nouvelle valeur en gardant style
+            stock_cell.value = round(new_stock, 2)
+            try:
+                stock_cell.number_format = "0.00"
+            except Exception:
+                pass
+
+            if highlight:
+                stock_cell.fill = changed_fill
+
+            total_updates += 1
+
+    if total_updates == 0:
+        raise ValueError("Aucune ligne de cuverie n'a matché la consommation (vérifie Produit/N° Cuve et formats).")
+
+    # Export
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".xlsx") as tmp_out:
+        out_path = tmp_out.name
+
+    wb.save(out_path)
+    return out_path
 
 # ==========================================================
 # HELPERS COMMUNS
@@ -1821,6 +1979,40 @@ def tab_degustation_live():
 # ==========================================================
 def tab_stock_update():
     st.subheader("📦 Mise à jour des stocks (anti double-application + rapprochement)")
+    st.markdown("### 🔁 Sortir l'état cuverie à jour (même mise en forme)")
+    cA, cB, cC = st.columns([1.2, 1.2, 0.8])
+    with cA:
+        cuverie_in = st.file_uploader("📥 État cuverie ORIGINAL (Excel)", type=["xlsx"], key="cuverie_orig")
+        st.caption("On conserve mise en forme / feuilles / styles.")
+    with cB:
+        assemblage_in = st.file_uploader("🧪 Assemblage validé (Excel)", type=["xlsx"], key="assemblage_for_cuverie")
+    with cC:
+        essai_cuv = st.selectbox("Essai", ["E1","E2","E3","E4","E5"], index=0, key="essai_cuverie")
+
+    highlight = st.checkbox("Surligner les cellules En Stock modifiées", value=True, key="hl_cuverie")
+
+    if cuverie_in and assemblage_in:
+        if st.button("✅ Générer l'état cuverie à jour", type="primary", use_container_width=True):
+            try:
+                out_path = export_cuverie_with_updated_stock_keep_format(
+                    cuverie_file=cuverie_in,
+                    assemblage_file=assemblage_in,
+                    essai=essai_cuv,
+                    highlight=highlight,
+                )
+                with open(out_path, "rb") as f:
+                    st.download_button(
+                        "📥 Télécharger l'état cuverie à jour (format d'origine)",
+                        f,
+                        file_name=f"ETAT_CUVERIE_MAJ_{essai_cuv}.xlsx",
+                        use_container_width=True
+                    )
+                st.success("✅ État cuverie généré (mise en forme conservée).")
+            except Exception as e:
+                st.error(f"Erreur : {e}")
+
+    st.divider()
+    
     st.markdown(
         """
         <div class="card">
@@ -1961,6 +2153,7 @@ with tab2:
 
 with tab3:
     tab_stock_update()
+
 
 
 
