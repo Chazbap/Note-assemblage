@@ -482,7 +482,7 @@ def read_consumption_by_cuve_and_code(assemblage_xlsx, essai="E1") -> pd.DataFra
         raise ValueError(f"Colonnes manquantes dans l'assemblage pour {essai}: {sorted(missing)}")
 
     d = df.copy()
-    d["Code Produit en Cuve"] = d["Code Produit en Cuve"].apply(_norm_key)
+    d["Code Produit en Cuve"] = d["Code Produit en Cuve"].apply(normalize_key)
     d["N° Cuve"] = d["N° Cuve"].apply(cuve_to_int_or_none)
     d[qty_col] = coerce_float(d[qty_col]).fillna(0.0)
 
@@ -504,52 +504,36 @@ def export_cuverie_with_updated_stock_keep_format(
     assemblage_file,       # streamlit UploadedFile
     essai="E1",
     highlight=True,
-    codes_file=None,       # streamlit UploadedFile (codes produits)
-    codes_ass_file=None,   # streamlit UploadedFile (liste produits assemblage)
+    codes_mapper: dict | None = None,
 ) -> str:
     """
     Ouvre le fichier cuverie ORIGINAL (conserve mise en forme),
-    décrémente 'En Stock' par (N° Cuve, Produit) selon l'assemblage,
-    en canonicalisant Produit/Code via mapping (codes produits + listes assemblage),
-    puis exporte un nouveau xlsx.
+    décrémente 'En Stock' par (N° Cuve, Code Produit en Cuve) selon l'assemblage,
+    en utilisant codes_mapper pour éviter les non-match Produit/Clé/Libellé.
     """
-    # 1) Construire mapping alias -> code canonique (si fourni)
-    alias_to_code = {}
-    try:
-        df_codes = pd.read_excel(codes_file) if codes_file is not None else pd.DataFrame()
-        df_codes_ass = pd.read_excel(codes_ass_file) if codes_ass_file is not None else pd.DataFrame()
-        alias_to_code = build_alias_to_code_map(df_codes, df_codes_ass)
-    except Exception:
-        alias_to_code = {}
+    codes_mapper = codes_mapper or {}
 
-    def canonical_code(x):
-        k = _norm_key(x)
-        return alias_to_code.get(k, k)
-
-    # 2) Conso par cuve+code depuis assemblage
+    # Conso par cuve+code (déjà normalisée via normalize_key)
     cons = read_consumption_by_cuve_and_code(assemblage_file, essai=essai)
     if cons.empty:
         raise ValueError(f"Aucune consommation détectée dans l'assemblage pour {essai}.")
 
-    # Canonicaliser les codes côté assemblage
-    cons["Code Produit en Cuve"] = cons["Code Produit en Cuve"].apply(canonical_code)
-
     cons_map = {
-        (int(r["N° Cuve"]), str(r["Code Produit en Cuve"]).strip()): float(r["Consommé (L)"])
+        (int(r["N° Cuve"]), normalize_key(r["Code Produit en Cuve"])): float(r["Consommé (L)"])
         for _, r in cons.iterrows()
     }
 
-    # 3) Sauver le fichier cuverie en local pour openpyxl
+    # Sauver le fichier cuverie en local pour openpyxl
     with tempfile.NamedTemporaryFile(delete=False, suffix=".xlsx") as tmp:
         cuv_path = tmp.name
         tmp.write(cuverie_file.getvalue())
 
     wb = load_workbook(cuv_path)
 
-    # Style surlignage
     changed_fill = PatternFill(start_color="FFF2CC", end_color="FFF2CC", fill_type="solid")
 
     total_updates = 0
+    example_misses = []
 
     for ws in wb.worksheets:
         header_row, hmap = find_header_row_ws(ws, required_headers=("Produit", "En Stock", "N° Cuve"))
@@ -561,22 +545,47 @@ def export_cuverie_with_updated_stock_keep_format(
         col_cuve = hmap["N° Cuve"]
 
         for r in range(header_row + 1, ws.max_row + 1):
-            produit = ws.cell(row=r, column=col_produit).value
-            cuve = ws.cell(row=r, column=col_cuve).value
+            produit_raw = ws.cell(row=r, column=col_produit).value
+            cuve_raw = ws.cell(row=r, column=col_cuve).value
             stock_cell = ws.cell(row=r, column=col_stock)
 
-            # ignorer lignes vides
-            if (produit in (None, "")) and (cuve in (None, "")):
+            if produit_raw in (None, "") and cuve_raw in (None, ""):
                 continue
 
-            prod_key = canonical_code(produit)
-            cuv_int = cuve_to_int_or_none(cuve)
-            if not prod_key or cuv_int is None:
+            cuv_int = cuve_to_int_or_none(cuve_raw)
+            if cuv_int is None:
                 continue
 
-            key = (int(cuv_int), prod_key)
-            used = cons_map.get(key, 0.0)
+            # 🔑 Produit de la cuverie → essayer de le transformer en Code Produit en Cuve
+            p0 = normalize_key(produit_raw)
+            if not p0:
+                continue
+
+            # candidates: brut + sans espaces
+            candidates = [p0, p0.replace(" ", "")]
+            # mapping via codes (clé/libellé/code)
+            if p0 in codes_mapper:
+                candidates.insert(0, codes_mapper[p0])
+            if p0.replace(" ", "") in codes_mapper:
+                candidates.insert(0, codes_mapper[p0.replace(" ", "")])
+
+            # Dédupliquer en conservant l’ordre
+            seen = set()
+            candidates = [x for x in candidates if x and not (x in seen or seen.add(x))]
+
+            used = 0.0
+            matched_code = None
+            for code in candidates:
+                key = (int(cuv_int), normalize_key(code))
+                used = cons_map.get(key, 0.0)
+                if used > 0:
+                    matched_code = code
+                    break
+
             if used <= 0:
+                # pour debug léger
+                if len(example_misses) < 8:
+                    example_misses.append((int(cuv_int), p0))
                 continue
 
             old = stock_cell.value
@@ -600,11 +609,12 @@ def export_cuverie_with_updated_stock_keep_format(
             total_updates += 1
 
     if total_updates == 0:
-        sample = list(cons_map.keys())[:10]
+        # donner une erreur utile
+        sample = ", ".join([str(x) for x in example_misses[:8]])
         raise ValueError(
-            "Aucune ligne de cuverie n'a matché la consommation.\n"
-            f"Exemples clés conso (cuve, code): {sample}\n"
-            "➡️ Fournis les fichiers 'Codes produits' + 'Liste produits ASSEMBLAGE' pour mapper Produit/Clé/Libellé vers Code."
+            "Aucune ligne de cuverie n'a matché la consommation. "
+            "Vérifie que la colonne 'Produit' correspond bien au Code/Clé/Libellé des fichiers codes. "
+            f"Exemples (cuve, produit_normalisé) vus: {sample}"
         )
 
     with tempfile.NamedTemporaryFile(delete=False, suffix=".xlsx") as tmp_out:
@@ -612,6 +622,7 @@ def export_cuverie_with_updated_stock_keep_format(
 
     wb.save(out_path)
     return out_path
+
 
 # ==========================================================
 # HELPERS COMMUNS
@@ -863,6 +874,82 @@ def export_rebuilt_cuverie_excel(df_rebuilt: pd.DataFrame, titre: str) -> str:
 
     wb.save(out_path)
     return out_path
+
+def normalize_key(x) -> str:
+    """Normalisation forte pour matcher des codes/libellés/clé."""
+    if x is None or (isinstance(x, float) and np.isnan(x)):
+        return ""
+    s = str(x).strip()
+    s = s.replace("\u00A0", " ")  # nbsp
+    s = re.sub(r"\s+", " ", s)
+    return s.upper().strip()
+
+def build_codes_mapper(df_codes_all: pd.DataFrame) -> dict:
+    """
+    Construit un mapping robuste vers Code Produit en Cuve à partir de:
+    - Code Produit en Cuve
+    - Clé Produit en Cuve
+    - Libéllé Produit en Cuve  (orthographe dans tes fichiers)
+    Retour: dict {variant_normalisée: code_normalisé}
+    """
+    if df_codes_all is None or df_codes_all.empty:
+        return {}
+
+    # Tolérance orthographe libellé
+    lib_cols = [c for c in df_codes_all.columns if normalize_key(c) in (
+        "LIBÉLLÉ PRODUIT EN CUVE", "LIBELLÉ PRODUIT EN CUVE", "LIBELLE PRODUIT EN CUVE"
+    )]
+    lib_col = lib_cols[0] if lib_cols else None
+
+    required = {"Clé Produit en Cuve", "Code Produit en Cuve"}
+    if not required.issubset(set(df_codes_all.columns)):
+        return {}
+
+    m = {}
+
+    for _, r in df_codes_all.iterrows():
+        code = normalize_key(r.get("Code Produit en Cuve", ""))
+        if not code:
+            continue
+
+        cle = normalize_key(r.get("Clé Produit en Cuve", ""))
+        lib = normalize_key(r.get(lib_col, "")) if lib_col else ""
+
+        # Ajoute plusieurs variantes → même code
+        m[code] = code
+        if cle:
+            m[cle] = code
+        if lib:
+            m[lib] = code
+
+        # Variante sans espaces (utile si certains fichiers collent des espaces)
+        m[code.replace(" ", "")] = code
+        if cle:
+            m[cle.replace(" ", "")] = code
+        if lib:
+            m[lib.replace(" ", "")] = code
+
+    return m
+
+def load_codes_all_df_from_uploads(codes_file, codes_ass_file) -> pd.DataFrame:
+    """
+    Lit les 2 excels (Codes produits + Liste produits ASSEMBLAGE) et renvoie df concaténé.
+    codes_file / codes_ass_file : UploadedFile streamlit (ou None)
+    """
+    dfs = []
+    if codes_file is not None:
+        dfs.append(pd.read_excel(codes_file))
+    if codes_ass_file is not None:
+        dfs.append(pd.read_excel(codes_ass_file))
+    if not dfs:
+        return pd.DataFrame()
+    df = pd.concat(dfs, ignore_index=True)
+    # Nettoyage simple
+    if "Code Produit en Cuve" in df.columns:
+        df["Code Produit en Cuve"] = df["Code Produit en Cuve"].apply(lambda x: str(x).strip())
+    if "Clé Produit en Cuve" in df.columns:
+        df["Clé Produit en Cuve"] = df["Clé Produit en Cuve"].apply(lambda x: str(x).strip())
+    return df
 
 
 # ==========================================================
@@ -1168,6 +1255,12 @@ def tab_assemblage():
     df_cuves = pd.read_excel(uploaded_file_cuves)
     df_codes = pd.read_excel(uploaded_file_codes)
     df_codes_ass = pd.read_excel(uploaded_file_codes_assemblage)
+
+# ✅ Mémoriser les 2 fichiers codes pour les autres onglets (ex: mise à jour cuverie)
+    df_codes_all_session = pd.concat([df_codes, df_codes_ass], ignore_index=True)
+    st.session_state["codes_all_df"] = df_codes_all_session
+    st.session_state["codes_mapper"] = build_codes_mapper(df_codes_all_session)
+
 
     # Normalisation
     if "Produit" in df_cuves.columns:
@@ -2043,6 +2136,22 @@ def tab_stock_update():
     st.subheader("📦 Mise à jour des stocks (anti double-application + rapprochement)")
     st.markdown("### 🔁 Sortir l'état cuverie à jour (même mise en forme)")
 
+    # ✅ Optionnel : re-upload codes ici, sinon on réutilise ceux de l’onglet Assemblage
+    with st.expander("🧩 (Optionnel) Codes produits pour mapping (sinon on réutilise ceux importés au début)", expanded=False):
+        c1, c2 = st.columns(2)
+        with c1:
+            codes_file_local = st.file_uploader("Codes produits (Excel)", type=["xlsx"], key="codes_stockupdate")
+        with c2:
+            codes_ass_file_local = st.file_uploader("Liste produits ASSEMBLAGE (Excel)", type=["xlsx"], key="codes_ass_stockupdate")
+    
+    # Construire mapper: priorité aux fichiers uploadés ici, sinon session_state
+    codes_mapper = None
+    if codes_file_local is not None or codes_ass_file_local is not None:
+        df_codes_all_local = load_codes_all_df_from_uploads(codes_file_local, codes_ass_file_local)
+        codes_mapper = build_codes_mapper(df_codes_all_local)
+    else:
+        codes_mapper = st.session_state.get("codes_mapper", None)
+    
     cA, cB, cC = st.columns([1.2, 1.2, 0.8])
     with cA:
         cuverie_in = st.file_uploader("📥 État cuverie ORIGINAL (Excel)", type=["xlsx"], key="cuverie_orig")
@@ -2051,16 +2160,12 @@ def tab_stock_update():
         assemblage_in = st.file_uploader("🧪 Assemblage validé (Excel)", type=["xlsx"], key="assemblage_for_cuverie")
     with cC:
         essai_cuv = st.selectbox("Essai", ["E1","E2","E3","E4","E5"], index=0, key="essai_cuverie")
-
-    # ✅ NOUVEAU : uploaders mapping
-    with st.expander("🔗 Mapping codes produits (recommandé)", expanded=True):
-        codes_std = st.file_uploader("📘 Codes produits (Excel)", type=["xlsx"], key="codes_std_for_cuverie")
-        codes_ass = st.file_uploader("📗 Liste produits ASSEMBLAGE (Excel)", type=["xlsx"], key="codes_ass_for_cuverie")
-        st.caption("Permet de mapper Produit/Clé/Libellé vers Code Produit en Cuve (évite les non-match).")
-
+    
     highlight = st.checkbox("Surligner les cellules En Stock modifiées", value=True, key="hl_cuverie")
-
+    
     if cuverie_in and assemblage_in:
+        if codes_mapper is None or len(codes_mapper) == 0:
+            st.warning("⚠️ Aucun mapping codes disponible. Va dans l’onglet Assemblage et importe les 2 fichiers codes, ou upload-les ici.")
         if st.button("✅ Générer l'état cuverie à jour", type="primary", use_container_width=True):
             try:
                 out_path = export_cuverie_with_updated_stock_keep_format(
@@ -2068,8 +2173,7 @@ def tab_stock_update():
                     assemblage_file=assemblage_in,
                     essai=essai_cuv,
                     highlight=highlight,
-                    codes_file=codes_std,
-                    codes_ass_file=codes_ass,
+                    codes_mapper=codes_mapper or {},
                 )
                 with open(out_path, "rb") as f:
                     st.download_button(
@@ -2081,6 +2185,7 @@ def tab_stock_update():
                 st.success("✅ État cuverie généré (mise en forme conservée).")
             except Exception as e:
                 st.error(f"Erreur : {e}")
+
 
     st.divider()
     
@@ -2224,6 +2329,7 @@ with tab2:
 
 with tab3:
     tab_stock_update()
+
 
 
 
