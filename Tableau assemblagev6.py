@@ -920,26 +920,26 @@ def tab_assemblage():
         st.text_input("Titre du fichier", value="Assemblage Avril 2025", key="titre_ass")
         
         if uploaded_prev_assemblage is not None:
-        try:
-            rebuilt = read_state_from_assemblage(uploaded_prev_assemblage, essai=essai_rebuild)
+            try:
+                rebuilt = read_state_from_assemblage(uploaded_prev_assemblage, essai=essai_rebuild)
+    
+                st.success(f"✅ Cuverie reconstruite depuis l'assemblage ({essai_rebuild})")
+                st.caption("Tu peux la télécharger puis la ré-uploader dans 'État cuverie (Excel)' pour recommencer un assemblage.")
+                st.dataframe(rebuilt, use_container_width=True)
+    
+                titre = f"CUVERIE_RECONSTRUITE — depuis assemblage ({essai_rebuild}) — {datetime.now().strftime('%Y-%m-%d')}"
+                rebuilt_path = export_rebuilt_cuverie_excel(rebuilt, titre=titre)
+    
+                with open(rebuilt_path, "rb") as f:
+                    st.download_button(
+                        "📥 Télécharger la cuverie reconstruite (Excel)",
+                        f,
+                        file_name=f"cuverie_reconstruite_{essai_rebuild}.xlsx",
+                        use_container_width=True
+                    )
 
-            st.success(f"✅ Cuverie reconstruite depuis l'assemblage ({essai_rebuild})")
-            st.caption("Tu peux la télécharger puis la ré-uploader dans 'État cuverie (Excel)' pour recommencer un assemblage.")
-            st.dataframe(rebuilt, use_container_width=True)
-
-            titre = f"CUVERIE_RECONSTRUITE — depuis assemblage ({essai_rebuild}) — {datetime.now().strftime('%Y-%m-%d')}"
-            rebuilt_path = export_rebuilt_cuverie_excel(rebuilt, titre=titre)
-
-            with open(rebuilt_path, "rb") as f:
-                st.download_button(
-                    "📥 Télécharger la cuverie reconstruite (Excel)",
-                    f,
-                    file_name=f"cuverie_reconstruite_{essai_rebuild}.xlsx",
-                    use_container_width=True
-                )
-
-        except Exception as e:
-            st.error(f"Erreur reconstruction cuverie : {e}")
+            except Exception as e:
+                st.error(f"Erreur reconstruction cuverie : {e}")
 
     if not (uploaded_file_cuves and uploaded_file_codes and uploaded_file_codes_assemblage):
         st.info("👉 Importer les 3 fichiers (cuverie + codes + liste assemblage) dans la sidebar.")
@@ -1961,6 +1961,7 @@ with tab2:
 
 with tab3:
     tab_stock_update()
+
 
 
 
