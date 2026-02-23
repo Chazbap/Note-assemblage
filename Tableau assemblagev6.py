@@ -491,6 +491,160 @@ def find_header_row(excel_path, needle="Clé Produit en Cuve", sheet_name=0, max
             return i
     return None
 
+def read_state_from_assemblage(assemblage_xlsx, essai="E1") -> pd.DataFrame:
+    """
+    Lit un fichier 'assemblage.xlsx' généré par l'app et reconstruit un état cuverie
+    (cuve par cuve) avec le stock restant après l'essai choisi.
+
+    Sortie: colonnes compatibles avec ton import cuverie:
+      - Produit (== Code Produit en Cuve)
+      - En Stock (restant)
+      - Année
+      - N° Cuve
+      - Cépage
+    + garde aussi Clé/Libellé si dispo.
+    """
+    header_row = find_header_row(assemblage_xlsx, needle="Clé Produit en Cuve")
+    if header_row is None:
+        raise ValueError("Impossible de trouver l'en-tête dans l'assemblage (Clé Produit en Cuve).")
+
+    df = pd.read_excel(assemblage_xlsx, header=header_row)
+
+    # Colonnes attendues (celles que TON export met déjà)
+    vol_col = f"Volume (L) {essai}"
+    qty_col = f"Quantité utilisée {essai}"
+    solde_col = f"Solde {essai}"  # peut être vide si Excel n'a pas calculé
+
+    required_base = {"N° Cuve", "Code Produit en Cuve", "Cépage", "Année"}
+    missing_base = required_base - set(df.columns)
+    if missing_base:
+        raise ValueError(f"Colonnes manquantes dans l'assemblage : {sorted(missing_base)}")
+
+    if vol_col not in df.columns and solde_col not in df.columns:
+        raise ValueError(f"Colonnes '{vol_col}' et '{solde_col}' introuvables pour {essai}.")
+    if qty_col not in df.columns:
+        raise ValueError(f"Colonne '{qty_col}' introuvable pour {essai}.")
+
+    d = df.copy()
+
+    # Nettoyage
+    d["Code Produit en Cuve"] = d["Code Produit en Cuve"].apply(normalize_str)
+    d["Cépage"] = d["Cépage"].apply(normalize_str)
+    d["Année"] = d["Année"]  # on garde tel quel (tu as déjà force_excel_years_to_int ailleurs)
+    d["N° Cuve"] = d["N° Cuve"].apply(cuve_to_int_or_none)
+
+    # Retirer titres / sous-totaux / total
+    # - lignes de titre: N° Cuve vide mais A rempli
+    # - sous-total: "Sous-total"
+    d = d[d["N° Cuve"].notna()].copy()
+    if "Clé Produit en Cuve" in d.columns:
+        d = d[d["Clé Produit en Cuve"].astype(str).str.strip().str.upper() != "SOUS-TOTAL"].copy()
+        d = d[d["Clé Produit en Cuve"].astype(str).str.strip().str.upper() != "TOTAL"].copy()
+
+    # Quantités
+    d[qty_col] = coerce_float(d[qty_col]).fillna(0.0)
+
+    # Volume restant: priorité à "Solde" si numérique, sinon Volume - Qty
+    if solde_col in d.columns:
+        d[solde_col] = coerce_float(d[solde_col])
+    else:
+        d[solde_col] = np.nan
+
+    if vol_col in d.columns:
+        d[vol_col] = coerce_float(d[vol_col])
+    else:
+        d[vol_col] = np.nan
+
+    # Calcul robuste du restant
+    d["_restant"] = d[solde_col]
+    mask_bad = d["_restant"].isna()
+    d.loc[mask_bad, "_restant"] = (d.loc[mask_bad, vol_col].fillna(0.0) - d.loc[mask_bad, qty_col].fillna(0.0))
+    d["_restant"] = d["_restant"].fillna(0.0)
+
+    # Eviter négatifs (si petits effets de calcul)
+    d["_restant"] = d["_restant"].clip(lower=0.0)
+
+    # Construire un état cuverie “rejouable”
+    out_cols = []
+    if "Clé Produit en Cuve" in d.columns: out_cols.append("Clé Produit en Cuve")
+    out_cols += ["N° Cuve", "Code Produit en Cuve"]
+    if "Libellé Produit en Cuve" in d.columns: out_cols.append("Libellé Produit en Cuve")
+    out_cols += ["Cépage", "Année"]
+
+    out = d[out_cols].copy()
+    out.rename(columns={"Code Produit en Cuve": "Produit"}, inplace=True)
+    out["En Stock"] = d["_restant"].round(2)
+
+    # On garde uniquement les cuves encore > 0 (sinon elles n’apparaîtront plus dans la sélection)
+    out = out[out["En Stock"] > 0].copy()
+
+    # Normaliser N° Cuve (int)
+    out["N° Cuve"] = out["N° Cuve"].astype(int)
+
+    # Ordonner façon “cuverie”
+    # (tu peux adapter si tu as d’autres colonnes historiques)
+    front = ["Produit", "En Stock", "Année", "N° Cuve", "Cépage"]
+    extra = [c for c in out.columns if c not in front]
+    out = out[front + extra]
+
+    # Tri lisible
+    out = out.sort_values(["Cépage", "Année", "N° Cuve", "Produit"], ascending=[True, False, True, True])
+    return out
+
+
+def export_rebuilt_cuverie_excel(df_rebuilt: pd.DataFrame, titre: str) -> str:
+    """
+    Export Excel simple + en-têtes stylés.
+    """
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".xlsx") as tmp:
+        out_path = tmp.name
+
+    with pd.ExcelWriter(out_path, engine="openpyxl") as writer:
+        df_rebuilt.to_excel(writer, sheet_name="CUVERIE_RECONSTRUITE", index=False)
+
+    wb = load_workbook(out_path)
+    ws = wb["CUVERIE_RECONSTRUITE"]
+
+    header_fill = PatternFill(start_color="1F4E79", end_color="1F4E79", fill_type="solid")
+    header_font = Font(bold=True, color="FFFFFF")
+    thin = Side(style="thin", color="000000")
+    border = Border(left=thin, right=thin, top=thin, bottom=thin)
+
+    ws.insert_rows(1)
+    ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=ws.max_column)
+    ws["A1"] = titre
+    ws["A1"].font = Font(bold=True, size=14)
+    ws["A1"].alignment = Alignment(horizontal="center", vertical="center")
+    ws.row_dimensions[1].height = 22
+
+    # Header row (ligne 2)
+    for cell in ws[2]:
+        cell.fill = header_fill
+        cell.font = header_font
+        cell.alignment = Alignment(horizontal="center", vertical="center")
+        cell.border = border
+
+    # Colonnes
+    for col in range(1, ws.max_column + 1):
+        ws.column_dimensions[get_column_letter(col)].width = 18
+
+    # Formats
+    # En Stock
+    col_map = {ws.cell(row=2, column=c).value: c for c in range(1, ws.max_column + 1)}
+    if "En Stock" in col_map:
+        cidx = col_map["En Stock"]
+        for r in range(3, ws.max_row + 1):
+            ws.cell(row=r, column=cidx).number_format = "0.00"
+
+    # Bordures
+    for r in range(3, ws.max_row + 1):
+        for c in range(1, ws.max_column + 1):
+            ws.cell(row=r, column=c).border = border
+
+    wb.save(out_path)
+    return out_path
+
+
 # ==========================================================
 # STOCK: anti double-application + delta
 # ==========================================================
@@ -752,9 +906,40 @@ def tab_assemblage():
         uploaded_file_codes_assemblage = st.file_uploader("Liste produits ASSEMBLAGE (Excel)", type=["xlsx"], key="ass_list_ass")
 
         st.divider()
+        st.header("🔁 Repartir d'un assemblage")
+        uploaded_prev_assemblage = st.file_uploader(
+            "Assemblage (Excel) → reconstruire une cuverie",
+            type=["xlsx"],
+            key="prev_ass_rebuild")
+        essai_rebuild = st.selectbox("Essai à utiliser (reliquat)", ["E1","E2","E3","E4","E5"], index=0, key="essai_rebuild")
+
+
+        st.divider()
         st.header("🧪 Assemblage — paramètres")
         st.number_input("Nombre d'essais", min_value=1, max_value=10, value=5, step=1, key="essais_ass")
         st.text_input("Titre du fichier", value="Assemblage Avril 2025", key="titre_ass")
+        
+        if uploaded_prev_assemblage is not None:
+        try:
+            rebuilt = read_state_from_assemblage(uploaded_prev_assemblage, essai=essai_rebuild)
+
+            st.success(f"✅ Cuverie reconstruite depuis l'assemblage ({essai_rebuild})")
+            st.caption("Tu peux la télécharger puis la ré-uploader dans 'État cuverie (Excel)' pour recommencer un assemblage.")
+            st.dataframe(rebuilt, use_container_width=True)
+
+            titre = f"CUVERIE_RECONSTRUITE — depuis assemblage ({essai_rebuild}) — {datetime.now().strftime('%Y-%m-%d')}"
+            rebuilt_path = export_rebuilt_cuverie_excel(rebuilt, titre=titre)
+
+            with open(rebuilt_path, "rb") as f:
+                st.download_button(
+                    "📥 Télécharger la cuverie reconstruite (Excel)",
+                    f,
+                    file_name=f"cuverie_reconstruite_{essai_rebuild}.xlsx",
+                    use_container_width=True
+                )
+
+        except Exception as e:
+            st.error(f"Erreur reconstruction cuverie : {e}")
 
     if not (uploaded_file_cuves and uploaded_file_codes and uploaded_file_codes_assemblage):
         st.info("👉 Importer les 3 fichiers (cuverie + codes + liste assemblage) dans la sidebar.")
@@ -1776,5 +1961,6 @@ with tab2:
 
 with tab3:
     tab_stock_update()
+
 
 
