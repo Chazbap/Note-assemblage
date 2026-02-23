@@ -55,6 +55,53 @@ st.markdown(
 
 CEPAGE_LABEL = {"C": "Chardonnay", "N": "Pinot Noir", "M": "Meunier"}
 
+# HELPERS (AJOUT) : mapping alias -> Code Produit en Cuve
+# ==========================================================
+def _norm_key(x) -> str:
+    """Normalisation clé robuste (trim + collapse espaces)."""
+    s = normalize_str(x)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+def build_alias_to_code_map(df_codes: pd.DataFrame, df_codes_ass: pd.DataFrame) -> dict:
+    """
+    Construit un mapping robuste:
+    - toute valeur plausible (Code / Clé / Libellé) pointe vers le 'Code Produit en Cuve' canonique.
+    """
+    alias = {}
+
+    def add_alias(k, code):
+        k = _norm_key(k)
+        code = _norm_key(code)
+        if k and code:
+            alias[k] = code
+
+    def ingest(df):
+        if df is None or df.empty:
+            return
+        # Colonnes possibles (tu as parfois Libéllé vs Libellé)
+        cols_possible = [
+            "Code Produit en Cuve",
+            "Clé Produit en Cuve",
+            "Libéllé Produit en Cuve",
+            "Libellé Produit en Cuve",
+        ]
+        # ne garder que celles présentes
+        cols = [c for c in cols_possible if c in df.columns]
+        if "Code Produit en Cuve" not in cols:
+            return
+
+        for _, r in df.iterrows():
+            code = r.get("Code Produit en Cuve", "")
+            if not _norm_key(code):
+                continue
+            for c in cols:
+                add_alias(r.get(c, ""), code)
+
+    ingest(df_codes)
+    ingest(df_codes_ass)
+    return alias
+
 # ==========================================================
 # SUPABASE (Degustation) - helpers
 # ==========================================================
@@ -435,11 +482,10 @@ def read_consumption_by_cuve_and_code(assemblage_xlsx, essai="E1") -> pd.DataFra
         raise ValueError(f"Colonnes manquantes dans l'assemblage pour {essai}: {sorted(missing)}")
 
     d = df.copy()
-    d["Code Produit en Cuve"] = d["Code Produit en Cuve"].apply(normalize_str)
+    d["Code Produit en Cuve"] = d["Code Produit en Cuve"].apply(_norm_key)
     d["N° Cuve"] = d["N° Cuve"].apply(cuve_to_int_or_none)
     d[qty_col] = coerce_float(d[qty_col]).fillna(0.0)
 
-    # Nettoyage: ignore titres / sous-totaux / lignes vides
     d = d[d["N° Cuve"].notna()].copy()
     d = d[(d["Code Produit en Cuve"] != "") & (d["Code Produit en Cuve"].str.upper() != "SOUS-TOTAL")].copy()
     d = d[d[qty_col] > 0].copy()
@@ -458,59 +504,72 @@ def export_cuverie_with_updated_stock_keep_format(
     assemblage_file,       # streamlit UploadedFile
     essai="E1",
     highlight=True,
+    codes_file=None,       # streamlit UploadedFile (codes produits)
+    codes_ass_file=None,   # streamlit UploadedFile (liste produits assemblage)
 ) -> str:
     """
     Ouvre le fichier cuverie ORIGINAL (conserve mise en forme),
-    décrémente 'En Stock' par (N° Cuve, Produit) selon l'assemblage (Quantité utilisée Ex),
+    décrémente 'En Stock' par (N° Cuve, Produit) selon l'assemblage,
+    en canonicalisant Produit/Code via mapping (codes produits + listes assemblage),
     puis exporte un nouveau xlsx.
     """
-    # Conso par cuve+code
+    # 1) Construire mapping alias -> code canonique (si fourni)
+    alias_to_code = {}
+    try:
+        df_codes = pd.read_excel(codes_file) if codes_file is not None else pd.DataFrame()
+        df_codes_ass = pd.read_excel(codes_ass_file) if codes_ass_file is not None else pd.DataFrame()
+        alias_to_code = build_alias_to_code_map(df_codes, df_codes_ass)
+    except Exception:
+        alias_to_code = {}
+
+    def canonical_code(x):
+        k = _norm_key(x)
+        return alias_to_code.get(k, k)
+
+    # 2) Conso par cuve+code depuis assemblage
     cons = read_consumption_by_cuve_and_code(assemblage_file, essai=essai)
     if cons.empty:
         raise ValueError(f"Aucune consommation détectée dans l'assemblage pour {essai}.")
+
+    # Canonicaliser les codes côté assemblage
+    cons["Code Produit en Cuve"] = cons["Code Produit en Cuve"].apply(canonical_code)
 
     cons_map = {
         (int(r["N° Cuve"]), str(r["Code Produit en Cuve"]).strip()): float(r["Consommé (L)"])
         for _, r in cons.iterrows()
     }
 
-    # Sauver le fichier cuverie en local pour openpyxl
+    # 3) Sauver le fichier cuverie en local pour openpyxl
     with tempfile.NamedTemporaryFile(delete=False, suffix=".xlsx") as tmp:
         cuv_path = tmp.name
         tmp.write(cuverie_file.getvalue())
 
     wb = load_workbook(cuv_path)
 
-    # Style de surlignage (optionnel)
+    # Style surlignage
     changed_fill = PatternFill(start_color="FFF2CC", end_color="FFF2CC", fill_type="solid")
 
     total_updates = 0
-    total_rows_seen = 0
 
     for ws in wb.worksheets:
         header_row, hmap = find_header_row_ws(ws, required_headers=("Produit", "En Stock", "N° Cuve"))
         if header_row is None:
-            continue  # feuille qui ne ressemble pas à une cuverie
+            continue
 
         col_produit = hmap["Produit"]
         col_stock = hmap["En Stock"]
         col_cuve = hmap["N° Cuve"]
 
-        # Parcours des lignes de données jusqu'à fin
         for r in range(header_row + 1, ws.max_row + 1):
             produit = ws.cell(row=r, column=col_produit).value
             cuve = ws.cell(row=r, column=col_cuve).value
             stock_cell = ws.cell(row=r, column=col_stock)
 
-            # Stop si ligne vide "forte" (à adapter si besoin)
-            if produit in (None, "") and cuve in (None, ""):
-                # on ne break pas forcément car certains fichiers ont des blocs plus loin,
-                # mais si tu veux, tu peux mettre un break après X lignes vides.
+            # ignorer lignes vides
+            if (produit in (None, "")) and (cuve in (None, "")):
                 continue
 
-            total_rows_seen += 1
-
-            prod_key = normalize_str(produit)
+            prod_key = canonical_code(produit)
             cuv_int = cuve_to_int_or_none(cuve)
             if not prod_key or cuv_int is None:
                 continue
@@ -529,7 +588,6 @@ def export_cuverie_with_updated_stock_keep_format(
             if new_stock < 0:
                 new_stock = 0.0
 
-            # Ecrire la nouvelle valeur en gardant style
             stock_cell.value = round(new_stock, 2)
             try:
                 stock_cell.number_format = "0.00"
@@ -542,9 +600,13 @@ def export_cuverie_with_updated_stock_keep_format(
             total_updates += 1
 
     if total_updates == 0:
-        raise ValueError("Aucune ligne de cuverie n'a matché la consommation (vérifie Produit/N° Cuve et formats).")
+        sample = list(cons_map.keys())[:10]
+        raise ValueError(
+            "Aucune ligne de cuverie n'a matché la consommation.\n"
+            f"Exemples clés conso (cuve, code): {sample}\n"
+            "➡️ Fournis les fichiers 'Codes produits' + 'Liste produits ASSEMBLAGE' pour mapper Produit/Clé/Libellé vers Code."
+        )
 
-    # Export
     with tempfile.NamedTemporaryFile(delete=False, suffix=".xlsx") as tmp_out:
         out_path = tmp_out.name
 
@@ -1980,6 +2042,7 @@ def tab_degustation_live():
 def tab_stock_update():
     st.subheader("📦 Mise à jour des stocks (anti double-application + rapprochement)")
     st.markdown("### 🔁 Sortir l'état cuverie à jour (même mise en forme)")
+
     cA, cB, cC = st.columns([1.2, 1.2, 0.8])
     with cA:
         cuverie_in = st.file_uploader("📥 État cuverie ORIGINAL (Excel)", type=["xlsx"], key="cuverie_orig")
@@ -1988,6 +2051,12 @@ def tab_stock_update():
         assemblage_in = st.file_uploader("🧪 Assemblage validé (Excel)", type=["xlsx"], key="assemblage_for_cuverie")
     with cC:
         essai_cuv = st.selectbox("Essai", ["E1","E2","E3","E4","E5"], index=0, key="essai_cuverie")
+
+    # ✅ NOUVEAU : uploaders mapping
+    with st.expander("🔗 Mapping codes produits (recommandé)", expanded=True):
+        codes_std = st.file_uploader("📘 Codes produits (Excel)", type=["xlsx"], key="codes_std_for_cuverie")
+        codes_ass = st.file_uploader("📗 Liste produits ASSEMBLAGE (Excel)", type=["xlsx"], key="codes_ass_for_cuverie")
+        st.caption("Permet de mapper Produit/Clé/Libellé vers Code Produit en Cuve (évite les non-match).")
 
     highlight = st.checkbox("Surligner les cellules En Stock modifiées", value=True, key="hl_cuverie")
 
@@ -1999,6 +2068,8 @@ def tab_stock_update():
                     assemblage_file=assemblage_in,
                     essai=essai_cuv,
                     highlight=highlight,
+                    codes_file=codes_std,
+                    codes_ass_file=codes_ass,
                 )
                 with open(out_path, "rb") as f:
                     st.download_button(
@@ -2153,6 +2224,7 @@ with tab2:
 
 with tab3:
     tab_stock_update()
+
 
 
 
