@@ -552,9 +552,20 @@ def export_cuverie_with_updated_stock_keep_format(
             if produit_raw in (None, "") and cuve_raw in (None, ""):
                 continue
 
-            cuv_int = cuve_to_int_or_none(cuve_raw)
-            if cuv_int is None:
+            # Si stock illisible, c'est probablement une ligne titre/texte → skip
+            stock_val = pd.to_numeric(stock_cell.value, errors="coerce")
+            if pd.isna(stock_val):
                 continue
+
+
+           # ✅ Corrige les cuves stockées en décimal (0,0042 -> 42)
+            cuv_norm = normalize_cuve_number(cuve_raw)
+            cuv_int = cuve_to_int_or_none(cuv_norm)
+            
+            # ignore cuves invalides / 0
+            if cuv_int is None or int(cuv_int) <= 0:
+                continue
+
 
             # 🔑 Produit de la cuverie → essayer de le transformer en Code Produit en Cuve
             p0 = normalize_key(produit_raw)
@@ -2329,6 +2340,7 @@ with tab2:
 
 with tab3:
     tab_stock_update()
+
 
 
 
